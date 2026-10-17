@@ -1,0 +1,25 @@
+# 子 agent / 专家模型路由固定（dsh-subagent-route-pin）。
+# 本文件是"包内默认行"：profile 的 cordis.patch.yml 里若已有同 id 行，以 profile 为准。
+# 专家（agency-agents）通过 provider: pinned-account 命中本插件注册的包装 provider，
+# 由 provider/model 两行固定它们实际调用的 LLM 路由；大脑（主 agent）不受影响。
+# 团队模式（agent-agents 不配 maxDepth 时的 native 引擎）成员不经过 provider.start，
+# 由本插件在 subagents.startContinuable 上补 agentOptions，同样固定到这条路由。
+#
+# 界面编辑：设置 → 专家模型（左侧导航）。保存写入 profile 补丁，下次召唤生效。
+- insert:
+    - id: subagent-route-pin
+      name: '@xywr8884156-tech/dsh-subagent-route-pin'
+      config:
+        # 注册的包装 provider 名；agency-agents 的 provider 必须与它一致。
+        providerName: pinned-account
+        # 真正干活的内置 provider（in-process 子 agent）。
+        baseProvider: spawn
+        # 固定给专家/子 agent 的 LLM 路由（"inherit" 由 settings 文件的 default 控制）。
+        provider: deepseek-account
+        model: deepseek-flash
+        reasoningEffort: ''
+        strict: false
+        # 团队模式（Agent Teams / agency native）成员的模型注入。
+        # 单发子代理走 provider 包装；团队成员不经过 provider.start，
+        # 由本插件在 startContinuable 上补 agentOptions。关掉就回落到继承大脑模型。
+        teamInjection: true

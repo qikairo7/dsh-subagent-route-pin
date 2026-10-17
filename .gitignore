@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.tgz
+.agent-teams/
+*.log
+.DS_Store

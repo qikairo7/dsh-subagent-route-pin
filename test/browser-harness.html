@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>client harness</title>
+</head>
+<body>
+<pre id="out">running…</pre>
+<script>
+  // ---- results -------------------------------------------------------
+  const lines = []
+  const failures = []
+  function check(name, ok, detail) {
+    lines.push((ok ? 'PASS ' : 'FAIL ') + name + (detail === undefined ? '' : ' :: ' + detail))
+    if (!ok) failures.push(name)
+  }
+
+  // ---- module loader + react stubs ----------------------------------
+  const registered = []
+  window.__ModuleLoader__ = {
+    load: (mod) => { window.__mod = mod }
+  }
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children: children.flat() }),
+    useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot()
+  }
+  const requireStub = (id) => {
+    if (id === 'react') return React
+    throw new Error('unexpected require: ' + id)
+  }
+
+  // ---- fake ctx ------------------------------------------------------
+  const dictionaries = {}
+  let formSnapshot = {
+    status: 'ready',
+    writable: true,
+    revision: 3,
+    value: { provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: 'high' }
+  }
+  const listeners = new Set()
+  const form = {
+    getSnapshot: () => formSnapshot,
+    subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener) },
+    mutate: async () => ({ ok: true })
+  }
+  const catalogCalls = []
+  const ctx = {
+    effect: (factory) => { const dispose = factory(); return typeof dispose === 'function' ? dispose : () => {} },
+    locale: {
+      bind: (ns) => (key) => (dictionaries[ns] && dictionaries[ns][key]) || ('<' + key + '>'),
+      register: (ns, table) => { dictionaries[ns] = table.zh || {}; return () => {} }
+    },
+    remote: {
+      $on: () => () => {},
+      session: {
+        modelCatalog: async () => {
+          catalogCalls.push(Date.now())
+          return {
+            ok: true,
+            value: {
+              groups: [
+                { id: 'our-free-model', name: 'Our Free Model', models: [{ id: 'deepseek-v4.1-flash-free', name: 'DeepSeek V4.1 Flash' }] },
+                { id: 'deepseek-account', name: 'DeepSeek', models: [{ id: 'deepseek-flash', name: 'DeepSeek Flash' }] }
+              ],
+              failures: []
+            }
+          }
+        }
+      }
+    },
+    configForms: {
+      get: (namespace) => (namespace === 'subagent-route-pin' ? form : undefined),
+      whileServed: (namespaces, factory) => factory()
+    },
+    slots: {
+      inject: (name, factory) => {
+        const dispose = factory()
+        return () => { if (typeof dispose === 'function') dispose() }
+      },
+      register: (options, render) => { registered.push({ options, render }); return () => {} }
+    }
+  }
+
+  // ---- load the real bundle -----------------------------------------
+  try {
+    const script = document.createElement('script')
+    script.src = '../client.js'
+    script.onload = () => run()
+    script.onerror = () => { check('bundle loads', false, 'script error'); report() }
+    document.head.appendChild(script)
+  } catch (error) {
+    check('bundle loads', false, String(error))
+    report()
+  }
+
+  function textOf(node) {
+    if (node === null || node === undefined) return ''
+    if (typeof node === 'string' || typeof node === 'number') return String(node)
+    if (Array.isArray(node)) return node.map(textOf).join(' ')
+    return (node.children || []).map(textOf).join(' ')
+  }
+
+  function renderNode(entry, t) {
+    const element = entry.render({ t })
+    // The slot host passes an element whose `type` is our component; render it.
+    return typeof element.type === 'function' ? element.type(element.props) : element
+  }
+
+  async function run() {
+    try {
+      const mod = window.__mod
+      check('module registered with loader', mod !== undefined && mod.id === '@xywr8884156-tech/dsh-subagent-route-pin', mod && mod.id)
+      const face = mod.factory(requireStub)
+      check('factory returns apply', typeof face.apply === 'function', typeof face.apply)
+      face.apply(ctx)
+      // Let the catalog promise settle so the picker reflects real lanes.
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      check('registers exactly one page', registered.length === 1, String(registered.length))
+      const entry = registered[0]
+      check('slot is settings.section', entry && entry.options.name === 'settings.section', entry && entry.options.name)
+      check('section id', entry && entry.options.id === 'subagent-route-pin', entry && entry.options.id)
+      check('section order', entry && entry.options.order === 36, entry && String(entry.options.order))
+      check('section label is localized', entry && entry.options.label() === '专家模型', entry && entry.options.label())
+      check('dictionaries registered', dictionaries['settings.subagent-route-pin'] !== undefined, JSON.stringify(Object.keys(dictionaries)))
+      check('catalog requested once', catalogCalls.length === 1, String(catalogCalls.length))
+
+      // render with a ready form
+      const tree = renderNode(entry, (key) => dictionaries['settings.subagent-route-pin'][key] || key)
+      const text = textOf(tree)
+      check('render does not throw', tree !== undefined && tree.type === 'div', tree && String(tree.type))
+      check('render shows provider label', text.includes('提供商'), text.slice(0, 120))
+      check('render shows description', text.includes('专家团'), text.slice(0, 160))
+      check('render offers free-model lane', text.includes('Our Free Model') || text.includes('our-free-model'), text.slice(0, 200))
+
+      // a missing config form must degrade, not throw
+      const savedForm = ctx.configForms.get
+      ctx.configForms.get = () => undefined
+      const face2 = mod.factory(requireStub)
+      registered.length = 0
+      let threw
+      try { face2.apply(ctx) } catch (error) { threw = error }
+      check('apply survives missing form', threw === undefined, threw && String(threw))
+      check('page still registered without form', registered.length === 1, String(registered.length))
+      const degraded = textOf(renderNode(registered[0], (key) => key))
+      check('degraded render is non-empty', degraded.length > 0, degraded.slice(0, 80))
+      ctx.configForms.get = savedForm
+
+      // a client context without the remote API must not break the page
+      const savedRemote = ctx.remote
+      ctx.remote = undefined
+      registered.length = 0
+      let threwRemote
+      try { mod.factory(requireStub).apply(ctx) } catch (error) { threwRemote = error }
+      check('apply survives missing remote', threwRemote === undefined, threwRemote && String(threwRemote))
+      check('page registered without remote', registered.length === 1, String(registered.length))
+      ctx.remote = savedRemote
+
+      check('no unhandled rejection', true, '')
+    } catch (error) {
+      check('harness ran', false, String(error && error.stack ? error.stack : error))
+    }
+    report()
+  }
+
+  function report() {
+    const summary = failures.length === 0 ? 'ALL PASS' : failures.length + ' FAIL'
+    document.getElementById('out').textContent = summary + '\n' + lines.join('\n')
+    console.log('[HARNESS] ' + summary)
+    for (const line of lines) console.log('[HARNESS] ' + line)
+  }
+</script>
+</body>
+</html>

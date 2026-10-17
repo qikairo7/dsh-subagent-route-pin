@@ -1,0 +1,59 @@
+{
+  "name": "@xywr8884156-tech/dsh-subagent-route-pin",
+  "version": "0.4.0",
+  "description": "DSH host+client plugin: pins the LLM route of delegated child agents (Agency experts, Agent-Teams members) without touching the main agent, and adds a Settings page that edits that route like the main-agent model picker.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "subagent",
+    "llm-route",
+    "agent-teams",
+    "agency-agents"
+  ],
+  "author": "沈思宏 <325603561+xywr8884156-tech@users.noreply.github.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xywr8884156-tech/dsh-subagent-route-pin.git"
+  },
+  "homepage": "https://github.com/xywr8884156-tech/dsh-subagent-route-pin#readme",
+  "bugs": {
+    "url": "https://github.com/xywr8884156-tech/dsh-subagent-route-pin/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "scripts": {
+    "test": "node test/run.mjs",
+    "pack:tgz": "pnpm pack --pack-destination dist"
+  }
+}
