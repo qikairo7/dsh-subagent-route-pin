@@ -23,3 +23,7 @@
         # 单发子代理走 provider 包装；团队成员不经过 provider.start，
         # 由本插件在 startContinuable 上补 agentOptions。关掉就回落到继承大脑模型。
         teamInjection: true
+        # 钉住的路由起不来（额度耗尽、provider 掉线、鉴权失败）时，
+        # 退回调用方原本的路由重试一次，而不是让委派直接失败。
+        # 只在"启动阶段"生效：子代理已经跑起来之后的流内错误抓不到。
+        fallback: true

@@ -14,13 +14,17 @@
  *   3. settings file `default`           — legacy fallback
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply } from '../index.js'
+import { apply, teamInjectionCapabilities } from '../index.js'
+
+const HOOK = Symbol.for('dsh-subagent-route-pin.continuable-hook')
 
 const dir = mkdtempSync(join(tmpdir(), 'route-pin-'))
 const settingsPath = join(dir, 'routes.json')
+// Never write the real readiness record from a test run.
+const readinessPath = join(dir, 'ready.json')
 
 const CAPABILITIES = { agentOptions: true, outputSchema: true, depthLimit: true, toolFilter: true, persona: true }
 
@@ -67,7 +71,7 @@ function makeHarness(config, extraCtx = {}) {
     },
     ...extraCtx
   }
-  apply(ctx, { settingsPath, ...config })
+  apply(ctx, { settingsPath, readinessPath, ...config })
   if (registered.length !== 1) throw new Error(`expected one registered provider, got ${registered.length}`)
   return { provider: registered[0], calls, logs, service, teamCalls }
 }
@@ -282,7 +286,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     },
     llm: { listProviders: () => [], async listModels() { return [] } }
   }
-  apply(ctx, { settingsPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
   check('provider registered into the live table', live.get('pinned-account') !== undefined)
   check('fiber scoped one disposer effect', effects.length === 1, String(effects.length))
   for (const callback of effects) callback()()
@@ -305,7 +309,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   }
   let threw
   try {
-    apply(ctx, { settingsPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+    apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
   } catch (error) {
     threw = error
   }
@@ -381,7 +385,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     llm: { listProviders: () => [{ id: 'deepseek-account' }], async listModels() { return [{ id: 'deepseek-flash' }] } }
   }
   writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
-  apply(ctx, { settingsPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
   check('hook is an own property of the service', Object.prototype.hasOwnProperty.call(service, 'startContinuable'))
   const spec = { label: 'x', request: { prompt: 'do', parent: {} } }
   await service.startContinuable(spec)
@@ -415,12 +419,180 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     }
   }
   writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
-  apply(ctx, { settingsPath, provider: 'deepseek-account', model: 'deepseek-flash' })
-  apply(ctx, { settingsPath, provider: 'our-free-model', model: 'deepseek-v4.1-flash-free' })
+  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+  apply(ctx, { settingsPath, readinessPath, provider: 'our-free-model', model: 'deepseek-v4.1-flash-free' })
   const spec = { label: 'x', request: { prompt: 'do', parent: {} } }
   await service.startContinuable(spec)
   check('remount swaps the resolver', spec.request.agentOptions?.model === 'deepseek-v4.1-flash-free', JSON.stringify(spec.request.agentOptions))
   check('hook installed exactly once', logs.filter(([, message]) => message.includes('team-mode hook installed')).length === 1)
+}
+
+// --- 22. the team-injection capability is a readable flag ----------------
+{
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  const capability = teamInjectionCapabilities(harness.service)
+  check('capability: team injection installed', capability.teamInjection === 'installed', JSON.stringify(capability))
+  check('capability: enabled mirrors the live switch', capability.enabled === true, JSON.stringify(capability))
+  check('capability: no reason when installed', capability.reason === undefined, JSON.stringify(capability))
+  const published = harness.service[HOOK].capabilities
+  check('capability published on the service symbol', published.teamInjection === 'installed', JSON.stringify(published))
+}
+
+// --- 23. a missing seam is a state, not just a warning -------------------
+{
+  const logs = []
+  const service = { getProvider: () => undefined, registerProvider: () => () => {} }
+  const ctx = {
+    logger: { info: (message) => logs.push(['info', message]), warn: (message) => logs.push(['warn', message]) },
+    subagents: service,
+    llm: {
+      listProviders: () => [{ id: 'deepseek-account' }],
+      async listModels() {
+        return [{ id: 'deepseek-flash' }]
+      }
+    }
+  }
+  writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
+  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+  const capability = teamInjectionCapabilities(service)
+  check('capability: unavailable without startContinuable', capability.teamInjection === 'unavailable', JSON.stringify(capability))
+  check('capability: names the missing seam', String(capability.reason).includes('startContinuable'), String(capability.reason))
+  check('capability: disabled is reported as off', capability.enabled === false, JSON.stringify(capability))
+  check(
+    'capability: one unavailable warning',
+    logs.filter(([, message]) => message.includes('team-mode injection unavailable')).length === 1
+  )
+  check('capability: logged in the startup summary', logs.some(([, message]) => message.includes('capabilities {')))
+  const record = JSON.parse(readFileSync(readinessPath, 'utf8'))
+  check(
+    'readiness: unavailable is recorded as a state',
+    record.mounted === true && record.capabilities.teamInjection === 'unavailable',
+    JSON.stringify(record.capabilities)
+  )
+}
+
+// --- 24. a dead pinned route falls back to the inherited route ----------
+{
+  const harness = makeHarness({ provider: 'our-free-model', model: 'deepseek-v4.1-flash-free' })
+  const attempts = []
+  harness.service.getProvider = () => ({
+    name: 'spawn',
+    capabilities: CAPABILITIES,
+    start(request) {
+      attempts.push(request)
+      if (attempts.length === 1) throw new Error('429 quota exhausted')
+      return { started: true, request }
+    }
+  })
+  const result = await harness.provider.start({
+    prompt: 'do',
+    parent: {},
+    label: 'x',
+    agentOptions: { provider: 'deepseek-account', model: 'deepseek-flash' }
+  })
+  check('fallback: the dead pin is retried', attempts.length === 2, String(attempts.length))
+  check(
+    'fallback: retry uses the inherited route',
+    result.request.agentOptions.provider === 'deepseek-account' && result.request.agentOptions.model === 'deepseek-flash',
+    JSON.stringify(result.request.agentOptions)
+  )
+  check('fallback: warned', harness.logs.some(([, message]) => message.includes('retrying on the inherited route')))
+}
+
+// --- 25. fallback: false keeps the failure fatal ------------------------
+{
+  const harness = makeHarness({ provider: 'our-free-model', model: 'deepseek-v4.1-flash-free', fallback: false })
+  harness.service.getProvider = () => ({
+    name: 'spawn',
+    capabilities: CAPABILITIES,
+    start() {
+      throw new Error('429 quota exhausted')
+    }
+  })
+  let threw
+  try {
+    await harness.provider.start({ prompt: 'do', parent: {}, label: 'x' })
+  } catch (error) {
+    threw = error
+  }
+  check('fallback off: the error propagates', threw !== undefined && threw.message === '429 quota exhausted')
+}
+
+// --- 26. a member that cannot start on the pin is retried without it ----
+{
+  const seen = []
+  const service = Object.create({
+    async startContinuable(spec) {
+      seen.push(spec.request.agentOptions)
+      if (spec.request.agentOptions !== undefined) throw new Error('quota exceeded')
+      return { ok: true }
+    }
+  })
+  service.getProvider = () => undefined
+  service.registerProvider = () => () => {}
+  const logs = []
+  const ctx = {
+    logger: { info: (message) => logs.push(['info', message]), warn: (message) => logs.push(['warn', message]) },
+    subagents: service,
+    llm: {
+      listProviders: () => [{ id: 'deepseek-account' }],
+      async listModels() {
+        return [{ id: 'deepseek-flash' }]
+      }
+    }
+  }
+  writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
+  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+  const result = await service.startContinuable({ label: 'x', request: { prompt: 'do', parent: {} } })
+  check('team fallback: retried once without the pin', seen.length === 2 && seen[0]?.model === 'deepseek-flash' && seen[1] === undefined, JSON.stringify(seen))
+  check('team fallback: member still starts', result.ok === true)
+  check('team fallback: warned', logs.some(([, message]) => message.includes('retrying on the inherited route')))
+}
+
+// --- 27. the three log lines are a contract -----------------------------
+{
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  await harness.service.startContinuable({ label: 'Researcher', request: { prompt: 'do', parent: {} } })
+  const messages = harness.logs.map(([, message]) => message).join('\n')
+  check('log contract: provider delegates', /provider "pinned-account" delegates to "spawn"/.test(messages))
+  check('log contract: hook installed', /team-mode hook installed on ctx\.subagents\.startContinuable/.test(messages))
+  check(
+    'log contract: team member -> provider/model',
+    /team member label="Researcher" -> deepseek-account\/deepseek-flash/.test(messages)
+  )
+  check('log contract: capabilities line present', /capabilities \{"teamInjection":"installed"/.test(messages))
+}
+
+// --- 28. the readiness record is what a post-upgrade check reads ---------
+{
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  const record = JSON.parse(readFileSync(readinessPath, 'utf8'))
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  check('readiness: record written', record.plugin === 'subagent-route-pin' && record.schema === 1, JSON.stringify(record))
+  check('readiness: version matches the manifest', record.version === manifest.version, String(record.version))
+  check('readiness: mounted', record.mounted === true)
+  check('readiness: capabilities installed', record.capabilities.teamInjection === 'installed', JSON.stringify(record.capabilities))
+  check('readiness: route reported', record.providerName === 'pinned-account' && record.baseProvider === 'spawn')
+  check('readiness: fallback reported', record.fallback === true)
+  check('readiness: teamInjection reported', record.teamInjection === true)
+  check('readiness: harness still usable', harness.provider !== undefined)
+}
+
+// --- 29. no subagent service is still recorded, as a state --------------
+{
+  const logs = []
+  const ctx = {
+    logger: { info: (message) => logs.push(['info', message]), warn: (message) => logs.push(['warn', message]) }
+  }
+  apply(ctx, { readinessPath })
+  const record = JSON.parse(readFileSync(readinessPath, 'utf8'))
+  check('readiness: absent service is mounted=false', record.mounted === false, JSON.stringify(record))
+  check(
+    'readiness: absent service names registerProvider',
+    String(record.capabilities?.reason).includes('registerProvider'),
+    JSON.stringify(record.capabilities)
+  )
+  check('readiness: absent service warns', logs.some(([, message]) => message.includes('registerProvider is unavailable')))
 }
 
 rmSync(dir, { recursive: true, force: true })

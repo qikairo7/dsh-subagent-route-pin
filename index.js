@@ -26,9 +26,23 @@
  * Resolved routes are checked against `ctx.llm` catalogs on a best-effort
  * basis — catalog membership is advisory in DSH, so a mismatch warns and falls
  * back instead of blocking, unless `strict: true`.
+ *
+ * The team-mode hook is wrapped in `TeamInjectionAdapter`, which probes the
+ * `ctx.subagents.startContinuable` seam once and publishes a capability flag
+ * (`{ teamInjection: 'installed' | 'unavailable', enabled, reason }`) on the
+ * service under `Symbol.for('dsh-subagent-route-pin.continuable-hook')`. A
+ * caller that sees `unavailable` knows team members keep the parent route and
+ * can degrade deliberately instead of trusting a log line.
+ *
+ * `fallback` (default on) makes a failed pin non-fatal: if the wrapped
+ * provider's `start()` rejects, the request is retried once on the route the
+ * caller already had (the parent/inherited route); a team member whose
+ * `startContinuable()` rejects is retried with `request.agentOptions` removed.
+ * Only start-time failures are observable at this seam — a quota error raised
+ * later, inside the child's own LLM stream, cannot be caught here.
  */
 
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -55,6 +69,39 @@ const CONTINUABLE_HOOK = Symbol.for('dsh-subagent-route-pin.continuable-hook')
 const PLUGIN = 'subagent-route-pin'
 
 const DEFAULT_SETTINGS_PATH = join(homedir(), '.dsh', 'subagent-route-pin.json')
+
+/**
+ * Where this plugin records its own readiness.
+ *
+ * `ctx.logger.info` reaches the DSH process console (visible in the GUI's dev
+ * console or the terminal DSH was started from) but is not persisted, and
+ * `~/.dsh/logs/startup-*.log` is a diagnostics dump written only when startup
+ * FAILS. A post-upgrade check therefore needs a file it can read: one small JSON
+ * record per boot, overwritten each time.
+ */
+const DEFAULT_READINESS_PATH = join(homedir(), '.dsh', 'subagent-route-pin.ready.json')
+
+/** Plugin version, read once; a missing package.json is not fatal. */
+const PLUGIN_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
+  } catch {
+    return undefined
+  }
+})()
+
+/**
+ * Publish the readiness record. Never throws: a read-only home directory must not
+ * take the profile down, it only costs the post-upgrade check its evidence.
+ */
+function recordReadiness(path, record) {
+  try {
+    writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, 'utf8')
+    return undefined
+  } catch (error) {
+    return describeError(error)
+  }
+}
 
 /** Read a config value that may be a live accessor (volatile) or plain. */
 function valueOf(field) {
@@ -107,7 +154,9 @@ function makeConfig(z) {
       providerName: z.string().default('pinned-account'),
       baseProvider: z.string().default('spawn'),
       settingsPath: z.string().default(DEFAULT_SETTINGS_PATH),
+      readinessPath: z.string().default(DEFAULT_READINESS_PATH),
       strict: z.boolean().default(false),
+      fallback: z.boolean().default(true),
       teamInjection: z.boolean().default(true).volatile(),
       provider: z.string().volatile(),
       model: z.string().volatile(),
@@ -176,6 +225,11 @@ function normalizeRoute(value, field, optional = false) {
 
 function routeKey(route) {
   return `${route.provider}/${route.model}`
+}
+
+/** One-line rendering for logs; never throws on odd thrown values. */
+function describeError(error) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function normalizeSettings(parsed) {
@@ -407,7 +461,7 @@ class RoutePinProvider {
   }
 
   async start(request) {
-    const { ctx } = this.options
+    const { ctx, config } = this.options
     const label = request !== null && typeof request === 'object' ? request.label : undefined
     const { route, source } = await this.pickRoute(label)
     const agentOptions = { ...(request.agentOptions ?? {}), provider: route.provider, model: route.model }
@@ -417,12 +471,31 @@ class RoutePinProvider {
       `${PLUGIN}: label=${JSON.stringify(label ?? null)} -> ${routeKey(route)}` +
         `${route.reasoningEffort === undefined ? '' : ` effort=${route.reasoningEffort}`} (${source})`
     )
-    return this.base().start({ ...request, agentOptions })
+    const base = this.base()
+    try {
+      return await base.start({ ...request, agentOptions })
+    } catch (error) {
+      // The pinned route is the one most likely to run dry (a free lane), so a
+      // start-time failure must not be the end of the delegation: retry once on
+      // whatever route the caller already had (normally the parent's).
+      const inherited = request.agentOptions
+      const sameRoute = inherited !== undefined && inherited.provider === route.provider && inherited.model === route.model
+      if (config.fallback !== true || sameRoute) throw error
+      ctx.logger.warn(
+        `${PLUGIN}: pinned route ${routeKey(route)} failed to start (${describeError(error)}); ` +
+          `retrying on the inherited route ${inherited === undefined ? '(parent default)' : routeKey(inherited)}`
+      )
+      return base.start({ ...request })
+    }
   }
 }
 
+/** Values of the `teamInjection` capability flag. */
+const TEAM_INJECTION_INSTALLED = 'installed'
+const TEAM_INJECTION_UNAVAILABLE = 'unavailable'
+
 /**
- * Team-mode hook.
+ * Team-mode hook, behind an adapter.
  *
  * Continuable children (Agent-Teams members, agency's native engine) never pass
  * through `provider.start(request)`: `SubagentManager.startContinuable()` reads
@@ -431,28 +504,97 @@ class RoutePinProvider {
  * only injection point, and the service object is not frozen, so one own
  * property on `ctx.subagents` covers it.
  *
+ * The adapter turns a missing seam into a *state* instead of a log line:
+ * `probe()` records why injection is impossible, `capabilities()` publishes
+ * `{ teamInjection, enabled, reason }`, and a caller reads it from
+ * `service[Symbol.for('dsh-subagent-route-pin.continuable-hook')].capabilities`
+ * (or via `teamInjectionCapabilities(service)`) to decide whether to degrade.
+ *
  * The hook is installed at most once per service; later plugin generations only
- * swap the resolver, so a remount never double-wraps. It never throws: a
- * missing route leaves the member on the inherited (parent) route.
+ * swap the resolver, so a remount never double-wraps. Injection never throws: a
+ * missing route leaves the member on the inherited (parent) route, and with
+ * `fallback` on, a rejected `startContinuable()` is retried once without the
+ * injected route instead of failing the delegation.
  */
-function installContinuableHook(ctx, resolveProvider) {
-  const service = ctx.subagents
-  if (service === null || service === undefined || typeof service.startContinuable !== 'function') {
-    ctx.logger.warn(`${PLUGIN}: ctx.subagents.startContinuable is unavailable; team-mode members keep the parent route`)
-    return undefined
+class TeamInjectionAdapter {
+  constructor(ctx) {
+    this.ctx = ctx
+    this.service = ctx.subagents
+    this.installed = false
+    this.reason = undefined
   }
-  const existing = service[CONTINUABLE_HOOK]
-  if (existing !== undefined) {
-    existing.resolve = resolveProvider
-    return existing
+
+  /** Probe the seam without mutating anything. */
+  probe() {
+    const service = this.service
+    if (service === null || service === undefined) {
+      return { teamInjection: TEAM_INJECTION_UNAVAILABLE, reason: 'ctx.subagents is unavailable in this DSH build' }
+    }
+    if (typeof service.startContinuable !== 'function') {
+      return {
+        teamInjection: TEAM_INJECTION_UNAVAILABLE,
+        reason: 'ctx.subagents.startContinuable is not exposed by this DSH build'
+      }
+    }
+    return { teamInjection: TEAM_INJECTION_INSTALLED, reason: undefined }
   }
-  const raw = service.startContinuable
-  const hadOwn = Object.prototype.hasOwnProperty.call(service, 'startContinuable')
-  const slot = { resolve: resolveProvider, raw, hadOwn }
+
+  /**
+   * Capability snapshot. `enabled` mirrors the live (volatile) `teamInjection`
+   * switch, so a caller can tell "cannot inject" from "turned off".
+   */
+  capabilities() {
+    if (!this.installed) {
+      return { teamInjection: TEAM_INJECTION_UNAVAILABLE, enabled: false, reason: this.reason }
+    }
+    const slot = this.service === null || this.service === undefined ? undefined : this.service[CONTINUABLE_HOOK]
+    let enabled
+    if (slot !== undefined && typeof slot.resolve === 'function') {
+      const provider = slot.resolve()
+      if (provider !== undefined) enabled = valueOf(provider.options.config.teamInjection) !== false
+    }
+    return {
+      teamInjection: this.installed ? TEAM_INJECTION_INSTALLED : TEAM_INJECTION_UNAVAILABLE,
+      enabled,
+      reason: this.reason
+    }
+  }
+
+  /** Install the hook once, or swap the resolver on a later generation. */
+  install(resolveProvider) {
+    const service = this.service
+    const ctx = this.ctx
+    const probe = this.probe()
+    if (probe.teamInjection === TEAM_INJECTION_UNAVAILABLE) {
+      this.installed = false
+      this.reason = probe.reason
+      // Publish the negative result too: a caller that looks at the service after
+      // a failed probe must be able to read *why* team injection is off.
+      if (service !== null && service !== undefined) {
+        service[CONTINUABLE_HOOK] = {
+          capabilities: { teamInjection: TEAM_INJECTION_UNAVAILABLE, enabled: false, reason: probe.reason }
+        }
+      }
+      ctx.logger.warn(
+        `${PLUGIN}: team-mode injection unavailable (${probe.reason}); team-mode members keep the parent route`
+      )
+      return this
+    }
+    const existing = service[CONTINUABLE_HOOK]
+    if (existing !== undefined && existing.adapter !== undefined) {
+      existing.resolve = resolveProvider
+      this.installed = true
+      this.reason = undefined
+      return this
+    }
+    const raw = service.startContinuable
+    const hadOwn = Object.prototype.hasOwnProperty.call(service, 'startContinuable')
+    const slot = { resolve: resolveProvider, raw, hadOwn, adapter: this }
   const hook = async function startContinuable(spec) {
+    const request = spec !== null && typeof spec === 'object' ? spec.request : undefined
+    let injected
     try {
       const provider = slot.resolve()
-      const request = spec !== null && typeof spec === 'object' ? spec.request : undefined
       if (
         provider !== undefined &&
         // Read live: `teamInjection` is volatile, so the Settings page can switch
@@ -468,6 +610,7 @@ function installContinuableHook(ctx, resolveProvider) {
           if (picked.route.reasoningEffort !== undefined) agentOptions.reasoningEffort = picked.route.reasoningEffort
           if (picked.route.maxTokens !== undefined) agentOptions.maxTokens = picked.route.maxTokens
           request.agentOptions = agentOptions
+          injected = picked
           ctx.logger.info(
             `${PLUGIN}: team member label=${JSON.stringify(spec.label ?? null)} -> ` +
               `${routeKey(picked.route)}${picked.route.reasoningEffort === undefined ? '' : ` effort=${picked.route.reasoningEffort}`} (${picked.source})`
@@ -475,32 +618,78 @@ function installContinuableHook(ctx, resolveProvider) {
         }
       }
     } catch (error) {
-      ctx.logger.warn(
-        `${PLUGIN}: team member route injection skipped: ${error instanceof Error ? error.message : String(error)}`
-      )
+      ctx.logger.warn(`${PLUGIN}: team member route injection skipped: ${describeError(error)}`)
     }
-    return raw.call(service, spec)
+    try {
+      return await raw.call(service, spec)
+    } catch (error) {
+      // A member that cannot start on the pinned route must not lose the whole
+      // delegation: drop the injection and retry once on the inherited route.
+      if (injected === undefined) throw error
+      const live = slot.resolve()
+      if (live === undefined || live.options.config.fallback !== true) throw error
+      delete request.agentOptions
+      ctx.logger.warn(
+        `${PLUGIN}: team member ${JSON.stringify(spec.label ?? null)} failed to start on ${routeKey(injected.route)} ` +
+          `(${describeError(error)}); retrying on the inherited route`
+      )
+      return raw.call(service, spec)
+    }
   }
-  try {
-    Object.defineProperty(service, 'startContinuable', {
-      value: hook,
-      enumerable: false,
-      configurable: true,
-      writable: true
-    })
-  } catch (error) {
-    ctx.logger.warn(
-      `${PLUGIN}: cannot hook ctx.subagents.startContinuable (${error instanceof Error ? error.message : String(error)}); ` +
-        `team-mode members keep the parent route`
-    )
-    return undefined
+    try {
+      Object.defineProperty(service, 'startContinuable', {
+        value: hook,
+        enumerable: false,
+        configurable: true,
+        writable: true
+      })
+    } catch (error) {
+      this.installed = false
+      this.reason = `cannot define ctx.subagents.startContinuable (${describeError(error)})`
+      ctx.logger.warn(`${PLUGIN}: ${this.reason}; team-mode members keep the parent route`)
+      return this
+    }
+    Object.defineProperty(slot, 'capabilities', { get: () => this.capabilities(), enumerable: true })
+    service[CONTINUABLE_HOOK] = slot
+    this.installed = true
+    this.reason = undefined
+    ctx.logger.info(`${PLUGIN}: team-mode hook installed on ctx.subagents.startContinuable`)
+    return this
   }
-  service[CONTINUABLE_HOOK] = slot
-  ctx.logger.info(`${PLUGIN}: team-mode hook installed on ctx.subagents.startContinuable`)
-  return slot
+
+  /** Remove this generation's hook, restoring whatever ran before it. */
+  dispose(resolveProvider) {
+    const service = this.service
+    const current = service === null || service === undefined ? undefined : service[CONTINUABLE_HOOK]
+    if (current === undefined || current.resolve !== resolveProvider) return
+    if (current.hadOwn) service.startContinuable = current.raw
+    else delete service.startContinuable
+    delete service[CONTINUABLE_HOOK]
+    this.installed = false
+  }
+}
+
+/**
+ * Public read-only view of the team-injection capability. Callers that hold the
+ * `ctx.subagents` service can ask whether team-mode routing is live instead of
+ * grepping the log.
+ */
+export function teamInjectionCapabilities(service) {
+  const slot = service === null || service === undefined ? undefined : service[CONTINUABLE_HOOK]
+  if (slot === undefined) {
+    return {
+      teamInjection: TEAM_INJECTION_UNAVAILABLE,
+      enabled: undefined,
+      reason: 'the route-pin hook is not installed on this service'
+    }
+  }
+  // A failed probe records its reason instead of installing a hook.
+  if (slot.adapter === undefined) return { ...slot.capabilities }
+  return slot.adapter.capabilities()
 }
 
 export function apply(ctx, config = {}) {
+  const readinessPath = text(valueOf(config.readinessPath), 'config.readinessPath', DEFAULT_READINESS_PATH)
   if (
     ctx.subagents === undefined ||
     ctx.subagents === null ||
@@ -509,6 +698,22 @@ export function apply(ctx, config = {}) {
     // A DSH build without the subagent service, or a future rename of it: refuse
     // loudly instead of throwing, so the rest of the profile still boots.
     ctx.logger.warn(`${PLUGIN}: ctx.subagents.registerProvider is unavailable; no route is pinned`)
+    // Record the failure too: "the plugin is gone" is exactly what a post-upgrade
+    // check must be able to distinguish from "the plugin was never installed".
+    recordReadiness(readinessPath, {
+      schema: 1,
+      plugin: PLUGIN,
+      version: PLUGIN_VERSION,
+      at: new Date().toISOString(),
+      node: process.version,
+      processId: process.pid,
+      mounted: false,
+      capabilities: {
+        teamInjection: TEAM_INJECTION_UNAVAILABLE,
+        enabled: false,
+        reason: 'ctx.subagents.registerProvider is unavailable in this DSH build'
+      }
+    })
     return
   }
   const settingsPath = text(valueOf(config.settingsPath), 'config.settingsPath', DEFAULT_SETTINGS_PATH)
@@ -516,7 +721,10 @@ export function apply(ctx, config = {}) {
     providerName: text(valueOf(config.providerName), 'config.providerName', 'pinned-account'),
     baseProvider: text(valueOf(config.baseProvider), 'config.baseProvider', 'spawn'),
     settingsPath,
+    readinessPath,
     strict: valueOf(config.strict) === true,
+    // Default on: a dead pinned lane must degrade, not fail the delegation.
+    fallback: valueOf(config.fallback) !== false,
     teamInjection: config.teamInjection,
     // Volatile fields stay as their live accessors; the provider reads them per spawn.
     provider: config.provider,
@@ -558,22 +766,37 @@ export function apply(ctx, config = {}) {
   // Team mode: continuable children bypass provider.start(), so their route has to
   // be filled into the request before SubagentManager reads it.
   const resolveProvider = () => provider
-  const slot = installContinuableHook(ctx, resolveProvider)
-  if (slot !== undefined) {
+  const adapter = new TeamInjectionAdapter(ctx).install(resolveProvider)
+  // One canonical readiness line + a machine-readable flag, so a deploy check can
+  // assert "team injection is live" without pattern-matching a WARN.
+  const capability = adapter.capabilities()
+  ctx.logger.info(`${PLUGIN}: capabilities ${JSON.stringify(capability)}`)
+  const readinessError = recordReadiness(normalized.readinessPath, {
+    schema: 1,
+    plugin: PLUGIN,
+    version: PLUGIN_VERSION,
+    at: new Date().toISOString(),
+    node: process.version,
+    processId: process.pid,
+    mounted: true,
+    providerName: normalized.providerName,
+    baseProvider: normalized.baseProvider,
+    settingsPath: normalized.settingsPath,
+    fallback: normalized.fallback,
+    teamInjection: normalized.teamInjection !== false,
+    capabilities: capability
+  })
+  if (readinessError !== undefined) {
+    ctx.logger.warn(
+      `${PLUGIN}: cannot write the readiness record ${normalized.readinessPath} (${readinessError}); ` +
+        'the post-upgrade check has to read the console log instead'
+    )
+  }
+  if (adapter.installed) {
     try {
-      ctx.effect(
-        () => () => {
-          const service = ctx.subagents
-          const current = service === null || service === undefined ? undefined : service[CONTINUABLE_HOOK]
-          if (current === undefined || current.resolve !== resolveProvider) return
-          if (current.hadOwn) service.startContinuable = current.raw
-          else delete service.startContinuable
-          delete service[CONTINUABLE_HOOK]
-        },
-        `${PLUGIN}: team hook`
-      )
+      ctx.effect(() => () => adapter.dispose(resolveProvider), `${PLUGIN}: team hook`)
     } catch (error) {
-      ctx.logger.warn(`${PLUGIN}: cannot scope the team hook disposer: ${error instanceof Error ? error.message : String(error)}`)
+      ctx.logger.warn(`${PLUGIN}: cannot scope the team hook disposer: ${describeError(error)}`)
     }
   }
 }
