@@ -16,7 +16,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: '@xywr8884156-tech/dsh-subagent-route-pin',
+  id: 'dsh-subagent-route-pin',
   factory: (require) => {
     const React = require('react')
     const h = React.createElement
@@ -27,11 +27,7 @@ window.__ModuleLoader__.load({
      * Config-form namespaces to try, in order: the explicit row id this bundle
      * inserts, then the package-derived id the loader may fall back to.
      */
-    const CONFIG_NS_CANDIDATES = [
-      'subagent-route-pin',
-      '@xywr8884156-tech/dsh-subagent-route-pin',
-      'dsh-subagent-route-pin'
-    ]
+    const CONFIG_NS_CANDIDATES = ['subagent-route-pin', 'dsh-subagent-route-pin']
     const EFFORTS = ['low', 'medium', 'high']
 
     const zh = {

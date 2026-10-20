@@ -109,7 +109,7 @@
   async function run() {
     try {
       const mod = window.__mod
-      check('module registered with loader', mod !== undefined && mod.id === '@xywr8884156-tech/dsh-subagent-route-pin', mod && mod.id)
+      check('module registered with loader', mod !== undefined && mod.id === 'dsh-subagent-route-pin', mod && mod.id)
       const face = mod.factory(requireStub)
       check('factory returns apply', typeof face.apply === 'function', typeof face.apply)
       face.apply(ctx)

@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "dsh-subagent-route-pin",
+    "subtitle": "把被委派子代理的模型钉在一条车道上，主 Agent 一行都不用改",
+    "locale": "zh-CN",
+    "output": ".archify/architecture-route-pin-20261020-0020/route-pin.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/tkaiz0406/dsh-subagent-route-pin.git",
+      "provider": "github",
+      "revision": "b8c220c7ed3df64c4fba8dbde0eb939a803db827"
+    }
+  },
+  "components": [
+    {
+      "id": "main",
+      "type": "external",
+      "label": "主 Agent",
+      "sublabel": "自己的模型选择不受影响",
+      "icon": "person",
+      "pos": [40, 250],
+      "size": [150, 100],
+      "sources": [{ "path": "index.js", "line": 264, "label": "RoutePinProvider" }]
+    },
+    {
+      "id": "agency",
+      "type": "frontend",
+      "label": "专家团专家",
+      "sublabel": "summon_expert",
+      "pos": [272, 140],
+      "size": [186, 62]
+    },
+    {
+      "id": "teams",
+      "type": "messagebus",
+      "label": "Agent Teams 成员",
+      "sublabel": "startContinuable 钩子",
+      "pos": [272, 269],
+      "size": [186, 62],
+      "sources": [{ "path": "index.js", "line": 519, "label": "TeamInjectionAdapter" }]
+    },
+    {
+      "id": "single",
+      "type": "backend",
+      "label": "单发子代理",
+      "sublabel": "subagent · spawn",
+      "pos": [272, 398],
+      "size": [186, 62]
+    },
+    {
+      "id": "pin",
+      "type": "security",
+      "label": "Route Pin",
+      "sublabel": "委派时改写 model / provider",
+      "tag": "pinned-account",
+      "pos": [540, 244],
+      "size": [200, 112],
+      "sources": [{ "path": "index.js", "line": 739, "label": "registerProvider" }]
+    },
+    {
+      "id": "pinned",
+      "type": "cloud",
+      "label": "钉住的路由",
+      "sublabel": "pinned-account / deepseek-flash",
+      "pos": [820, 186],
+      "size": [200, 64]
+    },
+    {
+      "id": "inherit",
+      "type": "backend",
+      "label": "继承路由",
+      "sublabel": "启动失败 / 额度耗尽时兜底",
+      "pos": [820, 368],
+      "size": [200, 64],
+      "sources": [{ "path": "index.js", "line": 486, "label": "retry on the inherited route" }]
+    }
+  ],
+  "connections": [
+    { "id": "main-agency", "from": "main", "to": "agency", "label": "委派", "variant": "emphasis" },
+    { "id": "main-teams", "from": "main", "to": "teams", "label": "委派" },
+    { "id": "main-single", "from": "main", "to": "single", "label": "委派" },
+    { "id": "agency-pin", "from": "agency", "to": "pin", "label": "钉模型" },
+    { "id": "teams-pin", "from": "teams", "to": "pin", "label": "注入钩子", "variant": "security" },
+    { "id": "single-pin", "from": "single", "to": "pin", "label": "钉模型" },
+    { "id": "pin-pinned", "from": "pin", "to": "pinned", "label": "钉住", "variant": "emphasis" },
+    { "id": "pin-inherit", "from": "pin", "to": "inherit", "label": "回退", "variant": "dashed" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "它要解决什么",
+      "items": [
+        "子代理默认继承主 Agent 的模型",
+        "想把便宜 / 免费车道只给子代理，以前只能连主 Agent 一起改"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "怎么钉的",
+      "items": [
+        "注册 pinned-account provider，主 Agent 完全不动",
+        "委派时改写 agentOptions：专家团、Agent Teams、单发三条路都覆盖"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "升级不再靠猜",
+      "items": [
+        "接口探测结果变成能力标志：teamInjection installed / unavailable + reason",
+        "每次启动写就绪记录，peerDependencies 钉 0.2.1-rc.2",
+        "node test/run.mjs —— 79 项断言，不需要 DSH 在跑"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "兜底",
+      "items": [
+        "钉住的路由启动失败 → 退回继承路由，委派不会当场失败",
+        "团队模式同样处理：删掉注入的 agentOptions 后重试"
+      ]
+    }
+  ]
+}

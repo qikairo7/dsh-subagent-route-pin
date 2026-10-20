@@ -8,7 +8,7 @@
 # 界面编辑：设置 → 专家模型（左侧导航）。保存写入 profile 补丁，下次召唤生效。
 - insert:
     - id: subagent-route-pin
-      name: '@xywr8884156-tech/dsh-subagent-route-pin'
+      name: 'dsh-subagent-route-pin'
       config:
         # 注册的包装 provider 名；agency-agents 的 provider 必须与它一致。
         providerName: pinned-account

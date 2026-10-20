@@ -43,7 +43,7 @@ const sandbox = {
 }
 runInNewContext(readFileSync(new URL('../client.js', import.meta.url), 'utf8'), sandbox)
 
-check('loader registration', loaded !== undefined && loaded.id === '@xywr8884156-tech/dsh-subagent-route-pin', loaded?.id)
+check('loader registration', loaded !== undefined && loaded.id === 'dsh-subagent-route-pin', loaded?.id)
 const module_ = loaded.factory(sandbox.require)
 check('module name', module_.name === 'subagent-route-pin', module_.name)
 check(

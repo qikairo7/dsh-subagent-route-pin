@@ -20,10 +20,10 @@
 
 ```bash
 # 从 tarball
-dsh plugin --profile desktop add "./@xywr8884156-tech-dsh-subagent-route-pin-0.5.0.tgz"
+dsh plugin --profile desktop add "./dsh-subagent-route-pin-0.6.0.tgz"
 
 # 从 npm（发布后）
-dsh plugin --profile desktop add "@xywr8884156-tech/dsh-subagent-route-pin"
+dsh plugin --profile desktop add "dsh-subagent-route-pin"
 
 # 从本地目录（开发调试，link 安装）
 dsh plugin --profile desktop add "D:\\path\\to\\dsh-subagent-route-pin"
@@ -35,7 +35,7 @@ dsh plugin --profile desktop add "D:\\path\\to\\dsh-subagent-route-pin"
 
 ```yaml
 - id: subagent-route-pin
-  name: "@xywr8884156-tech/dsh-subagent-route-pin"
+  name: "dsh-subagent-route-pin"
   config:
     providerName: pinned-account
     baseProvider: spawn
@@ -62,6 +62,36 @@ dsh plugin --profile desktop add "D:\\path\\to\\dsh-subagent-route-pin"
 > 注意：profile 的 patch 行是**整行替换 config**，改这一行时要把 `enabled` / `customExperts` / `enabledTeams` 等原字段一起重述，否则会被清空。
 
 Agent Teams（`@nanmicoder/dsh-agent-teams`）有自己的一套 `memberModel` / `memberLlmProvider`，插件不会覆盖它——两条路由各管各的，避免互相打架。
+
+## 看团队跑到哪了（本地面板）
+
+Agent Teams 自己是**条件渲染**的：会话标题栏那个入口只在「当前会话确实持有一个开跑的团队」时才出现，计划还在暂存（等你批准）、或者你换了会话、想看别的项目里的团队，界面上就什么都看不到。
+
+插件带了一个只读的状态面板，直接读磁盘上的 `.agent-teams/<team>/team.json`：
+
+```bash
+# 起一个本地面板，浏览器打开它给的地址，2 秒自动刷新
+npm run teams -- --scan "D:/你的工作区父目录"
+
+# 只想在终端看一眼
+npm run teams:once -- --dir "D:/你的项目"
+
+# 装了 npm 包的话，也可以直接用 bin
+dsh-team-status --serve --port 7800
+```
+
+参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--dir <path>` | 指定工作区根目录（其下有 `.agent-teams/`），可重复 |
+| `--scan <root>` | 把 root 自身和它的直接子目录里带 `.agent-teams` 的都扫进来 |
+| `--serve` | 起 HTTP 面板（默认 `127.0.0.1:7788`） |
+| `--port <n>` | 换端口 |
+
+面板显示：团队阶段、计划是否**待批准**、成员（角色/状态/模型）、任务表（ID/状态/负责人/依赖/尝试次数）、完成进度条。暂存态会直接提示「计划还没批准：去 Web 的计划卡点 Approve & Run，否则成员不会启动」——这就是最常见的「看不到团队」原因。
+
+它只读状态文件，不连 DSH、不改任何东西，所以任何会话、任何项目都能看。
 
 ## 验证
 
@@ -148,7 +178,7 @@ node test/logs.mjs --log captured-console.txt
 读取能力标志（宿主侧）：
 
 ```js
-import { teamInjectionCapabilities } from '@xywr8884156-tech/dsh-subagent-route-pin'
+import { teamInjectionCapabilities } from 'dsh-subagent-route-pin'
 
 // { teamInjection: 'installed' | 'unavailable', enabled?: boolean, reason?: string }
 const capability = teamInjectionCapabilities(ctx.subagents)
@@ -187,18 +217,31 @@ npm run ready                     # 3. 挂载层：就绪记录还是这次启�
 
 ## 发布
 
+包名是**不带 scope** 的 `dsh-subagent-route-pin`（npm 上确认未被占用），因此不需要拥有任何 npm 组织/scope，登录任意账号即可发布：
+
 ```bash
-npm login                      # 用户名需与 scope 一致：@xywr8884156-tech
-npm publish                    # publishConfig 已设 access=public
+npm login
+npm publish                    # 无 scope，默认为 public
 pnpm pack --pack-destination dist
 ```
 
-改 scope：只改 `package.json` 的 `name`、`cordis.patch.yml` 的 `name`、`client.js` 的 `__ModuleLoader__.load({ id })` 三处（三处必须完全一致）。
+> 若以后要改到自己的 scope（例如 `@yourname/dsh-subagent-route-pin`），必须同时改这 **4 处**，少一处就会出现「装上了但不加载」：
+>
+> | # | 位置 | 作用 |
+> | --- | --- | --- |
+> | 1 | `package.json` → `name` | 安装名、依赖解析名 |
+> | 2 | `cordis.patch.yml` → 行的 `name` | profile 加载器按包名找入口 |
+> | 3 | `client.js` → `__ModuleLoader__.load({ id })` | 浏览器端模块 id |
+> | 4 | `client.js` → `CONFIG_NS_CANDIDATES` | 设置页绑定配置行的候选名 |
+>
+> 另需同步 `test/client.mjs`、`test/browser-harness.html` 里的 id 断言，以及 README 里的安装示例。
+
+GitHub 仓库名与 npm 包名保持一致（`dsh-subagent-route-pin`），仓库归属 `xywr8884156-tech` 是 GitHub 账号，与 npm scope 无关，`repository`/`homepage`/`bugs` 无需随 npm 改名。
 
 ## 回滚
 
 ```bash
-dsh plugin --profile desktop remove "@xywr8884156-tech/dsh-subagent-route-pin"
+dsh plugin --profile desktop remove "dsh-subagent-route-pin"
 ```
 
 或删掉 profile `cordis.patch.yml` 里 `id: subagent-route-pin` 那一行。
