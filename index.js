@@ -28,18 +28,23 @@
  * back instead of blocking, unless `strict: true`.
  *
  * The team-mode hook is wrapped in `TeamInjectionAdapter`, which probes the
- * `ctx.subagents.startContinuable` seam once and publishes a capability flag
- * (`{ teamInjection: 'installed' | 'unavailable', enabled, reason }`) on the
- * service under `Symbol.for('dsh-subagent-route-pin.continuable-hook')`. A
- * caller that sees `unavailable` knows team members keep the parent route and
- * can degrade deliberately instead of trusting a log line.
+ * creation seams once — `startActivation` first (the current contract: the
+ * native delegation tool and Agent-Teams both call it), then `startContinuable`
+ * (the older name) — and publishes a capability flag
+ * (`{ teamInjection, enabled, seams, reason }`) on the service under
+ * `Symbol.for('dsh-subagent-route-pin.team-hook')`, also readable through the
+ * pre-0.8 `…continuable-hook` symbol and through `teamInjectionCapabilities()`.
+ * A caller that sees `unavailable` knows team members keep the parent route and
+ * can degrade deliberately instead of trusting a log line; because `seams`
+ * names what was actually wrapped, hooking a method the build does not call can
+ * no longer pass for success.
  *
  * `fallback` (default on) makes a failed pin non-fatal: if the wrapped
  * provider's `start()` rejects, the request is retried once on the route the
- * caller already had (the parent/inherited route); a team member whose
- * `startContinuable()` rejects is retried with `request.agentOptions` removed.
- * Only start-time failures are observable at this seam — a quota error raised
- * later, inside the child's own LLM stream, cannot be caught here.
+ * caller already had (the parent/inherited route); a team member whose creation
+ * call rejects is retried with `request.agentOptions` removed. Only start-time
+ * failures are observable at this seam — a quota error raised later, inside the
+ * child's own LLM stream, cannot be caught here.
  */
 
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
@@ -171,6 +176,10 @@ function makeConfig(z) {
       // no hand-edited YAML. Off only when someone wants to wire it themselves.
       autoWireAgency: z.boolean().default(true),
       teamInjection: z.boolean().default(true).volatile(),
+      // Agent Teams always fills `request.agentOptions` from its own
+      // `memberLlmProvider` / `memberModel`, so "only fill an empty slot" would
+      // never pin a single team member. Default on: the pinned route wins.
+      overrideMemberRoute: z.boolean().default(true).volatile(),
       provider: z.string().volatile(),
       model: z.string().volatile(),
       reasoningEffort: z.string().volatile(),
@@ -641,26 +650,70 @@ const TEAM_INJECTION_INSTALLED = 'installed'
 const TEAM_INJECTION_UNAVAILABLE = 'unavailable'
 
 /**
+ * Creation seams a team-mode member can arrive through, most-preferred first.
+ *
+ * `startActivation` is the current contract: `SubagentRuntime` exposes it, the
+ * native delegation tool calls it, and Agent-Teams' `startMember()` prefers it.
+ * `startContinuable` is the older name kept by dsh 0.2.0-rc.x. `start` is the
+ * single-shot path and is already covered by the provider wrapper, so it is not
+ * hooked here.
+ *
+ * Hooking the wrong one of these is invisible from the outside — the plugin
+ * mounts, logs a warning, and team members silently keep the parent route —
+ * which is why the probe reports which seam it actually wrapped.
+ */
+const TEAM_SEAMS = ['startActivation', 'startContinuable']
+
+/** Marks the service object that already carries this plugin's team hook. */
+const TEAM_HOOK = Symbol.for('dsh-subagent-route-pin.team-hook')
+
+/**
+ * Pre-0.8 symbol. Still published and still read, so a caller that learned the
+ * old path keeps working after the upgrade.
+ */
+const HOOK_SYMBOLS = [TEAM_HOOK, CONTINUABLE_HOOK]
+
+/** First hook slot published on a service, under either symbol. */
+function readHookSlot(service) {
+  if (service === null || service === undefined) return undefined
+  for (const symbol of HOOK_SYMBOLS) {
+    const slot = service[symbol]
+    if (slot !== undefined) return slot
+  }
+  return undefined
+}
+
+/** Publish a negative probe result, so "cannot inject" is readable, not inferred. */
+function publishUnavailable(service, reason) {
+  if (service === null || service === undefined) return
+  const capabilities = { teamInjection: TEAM_INJECTION_UNAVAILABLE, enabled: false, seams: [], reason }
+  for (const symbol of HOOK_SYMBOLS) service[symbol] = { capabilities }
+}
+
+/**
  * Team-mode hook, behind an adapter.
  *
  * Continuable children (Agent-Teams members, agency's native engine) never pass
- * through `provider.start(request)`: `SubagentManager.startContinuable()` reads
- * `spec.request.agentOptions` on line 1680 and hands the resulting route to
- * `agents.create()` itself. Filling that field before the call is therefore the
- * only injection point, and the service object is not frozen, so one own
- * property on `ctx.subagents` covers it.
+ * through `provider.start(request)` on this seam: `SubagentRuntime.startActivation()`
+ * dispatches to `SubagentManager.startLocal(spec)` whenever the provider
+ * implements `prepareContinuable`, and `startLocal` reads `request.agentOptions`
+ * itself to resolve the child's route. Filling that field before the call is
+ * therefore the only injection point, and the service object is not frozen, so
+ * one own property per seam on `ctx.subagents` covers it.
  *
  * The adapter turns a missing seam into a *state* instead of a log line:
- * `probe()` records why injection is impossible, `capabilities()` publishes
- * `{ teamInjection, enabled, reason }`, and a caller reads it from
- * `service[Symbol.for('dsh-subagent-route-pin.continuable-hook')].capabilities`
- * (or via `teamInjectionCapabilities(service)`) to decide whether to degrade.
+ * `probe()` records which seams exist (and why none do), `capabilities()`
+ * publishes `{ teamInjection, enabled, seams, reason }`, and a caller reads it
+ * from `teamInjectionCapabilities(service)` or from the service symbol to decide
+ * whether to degrade. Because the seam name is part of that state, "wrapped
+ * `startContinuable` on a build that only has `startActivation`" can no longer
+ * look like success.
  *
  * The hook is installed at most once per service; later plugin generations only
  * swap the resolver, so a remount never double-wraps. Injection never throws: a
  * missing route leaves the member on the inherited (parent) route, and with
- * `fallback` on, a rejected `startContinuable()` is retried once without the
- * injected route instead of failing the delegation.
+ * `fallback` on, a rejected creation call is retried once without the injected
+ * route instead of failing the delegation.
  */
 class TeamInjectionAdapter {
   constructor(ctx) {
@@ -668,21 +721,36 @@ class TeamInjectionAdapter {
     this.service = ctx.subagents
     this.installed = false
     this.reason = undefined
+    /** Seams actually wrapped by this generation, most-preferred first. */
+    this.seams = []
   }
 
-  /** Probe the seam without mutating anything. */
+  /** Seams this service exposes, most-preferred first. */
+  availableSeams() {
+    const service = this.service
+    if (service === null || service === undefined) return []
+    return TEAM_SEAMS.filter((seam) => typeof service[seam] === 'function')
+  }
+
+  /** Probe the seams without mutating anything. */
   probe() {
     const service = this.service
     if (service === null || service === undefined) {
-      return { teamInjection: TEAM_INJECTION_UNAVAILABLE, reason: 'ctx.subagents is unavailable in this DSH build' }
-    }
-    if (typeof service.startContinuable !== 'function') {
       return {
         teamInjection: TEAM_INJECTION_UNAVAILABLE,
-        reason: 'ctx.subagents.startContinuable is not exposed by this DSH build'
+        seams: [],
+        reason: 'ctx.subagents is unavailable in this DSH build'
       }
     }
-    return { teamInjection: TEAM_INJECTION_INSTALLED, reason: undefined }
+    const seams = this.availableSeams()
+    if (seams.length === 0) {
+      return {
+        teamInjection: TEAM_INJECTION_UNAVAILABLE,
+        seams,
+        reason: `ctx.subagents exposes none of ${TEAM_SEAMS.join(' / ')} in this DSH build`
+      }
+    }
+    return { teamInjection: TEAM_INJECTION_INSTALLED, seams, reason: undefined }
   }
 
   /**
@@ -691,18 +759,108 @@ class TeamInjectionAdapter {
    */
   capabilities() {
     if (!this.installed) {
-      return { teamInjection: TEAM_INJECTION_UNAVAILABLE, enabled: false, reason: this.reason }
+      return {
+        teamInjection: TEAM_INJECTION_UNAVAILABLE,
+        enabled: false,
+        seams: [],
+        reason: this.reason
+      }
     }
-    const slot = this.service === null || this.service === undefined ? undefined : this.service[CONTINUABLE_HOOK]
+    const slot = readHookSlot(this.service)
     let enabled
     if (slot !== undefined && typeof slot.resolve === 'function') {
       const provider = slot.resolve()
       if (provider !== undefined) enabled = valueOf(provider.options.config.teamInjection) !== false
     }
     return {
-      teamInjection: this.installed ? TEAM_INJECTION_INSTALLED : TEAM_INJECTION_UNAVAILABLE,
+      teamInjection: TEAM_INJECTION_INSTALLED,
       enabled,
+      seams: this.seams,
       reason: this.reason
+    }
+  }
+
+  /**
+   * Build one seam hook. Both `startActivation(spec)` and
+   * `startContinuable(spec)` receive `{ label, request, ... }`, so one body
+   * serves both; only the captured `raw` differs.
+   */
+  makeHook(seam, slot) {
+    const service = this.service
+    const ctx = this.ctx
+    return async function routePinHook(spec) {
+      const entry = slot.seams[seam]
+      const request = spec !== null && typeof spec === 'object' ? spec.request : undefined
+      let injected
+      let original
+      try {
+        const provider = slot.resolve()
+        if (
+          provider !== undefined &&
+          // Read live: `teamInjection` is volatile, so the Settings page can switch
+          // it without remounting this plugin.
+          valueOf(provider.options.config.teamInjection) !== false &&
+          request !== null &&
+          typeof request === 'object'
+        ) {
+          const config = provider.options.config
+          // Agent Teams fills `agentOptions` from its own `memberLlmProvider` /
+          // `memberModel`, so an empty-slot-only rule would never pin a member.
+          // `overrideMemberRoute` (default on) lets the pinned route win; a caller
+          // that already chose a route keeps it when the flag is off.
+          const claimed = request.agentOptions !== undefined
+          const mayOverride = claimed ? valueOf(config.overrideMemberRoute) !== false : true
+          const picked = mayOverride ? await provider.pickRoute(spec.label, true) : undefined
+          // A nested seam (an older runtime calling one method from the other)
+          // already carries the route: re-picking the same route would only add a
+          // duplicate log line, so treat "already pinned" as done.
+          const alreadyPinned =
+            picked !== undefined &&
+            claimed &&
+            request.agentOptions.provider === picked.route.provider &&
+            request.agentOptions.model === picked.route.model
+          if (picked !== undefined && !alreadyPinned) {
+            const agentOptions = claimed ? { ...request.agentOptions } : {}
+            agentOptions.provider = picked.route.provider
+            agentOptions.model = picked.route.model
+            if (picked.route.reasoningEffort !== undefined) {
+              agentOptions.reasoningEffort = picked.route.reasoningEffort
+            } else if (claimed) {
+              // The pinned route says nothing about effort; the claimed value was
+              // calibrated for the *old* route, so let the runtime pick the default.
+              delete agentOptions.reasoningEffort
+            }
+            if (picked.route.maxTokens !== undefined) agentOptions.maxTokens = picked.route.maxTokens
+            if (claimed) original = request.agentOptions
+            request.agentOptions = agentOptions
+            injected = picked
+            ctx.logger.info(
+              `${PLUGIN}: team member label=${JSON.stringify(spec.label ?? null)} -> ` +
+                `${routeKey(picked.route)}${picked.route.reasoningEffort === undefined ? '' : ` effort=${picked.route.reasoningEffort}`} (${picked.source})`
+            )
+          }
+        }
+      } catch (error) {
+        ctx.logger.warn(`${PLUGIN}: team member route injection skipped: ${describeError(error)}`)
+      }
+      try {
+        return await entry.raw.call(service, spec)
+      } catch (error) {
+        // A member that cannot start on the pinned route must not lose the whole
+        // delegation: drop the injection and retry once on the inherited route.
+        if (injected === undefined) throw error
+        const live = slot.resolve()
+        if (live === undefined || live.options.config.fallback !== true) throw error
+        // Restore what the caller asked for: dropping the whole object would also
+        // throw away Agent Teams' own member route.
+        if (original === undefined) delete request.agentOptions
+        else request.agentOptions = original
+        ctx.logger.warn(
+          `${PLUGIN}: team member ${JSON.stringify(spec.label ?? null)} failed to start on ${routeKey(injected.route)} ` +
+            `(${describeError(error)}); retrying on the ${original === undefined ? 'inherited' : 'requested'} route`
+        )
+        return entry.raw.call(service, spec)
+      }
     }
   }
 
@@ -714,118 +872,94 @@ class TeamInjectionAdapter {
     if (probe.teamInjection === TEAM_INJECTION_UNAVAILABLE) {
       this.installed = false
       this.reason = probe.reason
+      this.seams = []
       // Publish the negative result too: a caller that looks at the service after
       // a failed probe must be able to read *why* team injection is off.
-      if (service !== null && service !== undefined) {
-        service[CONTINUABLE_HOOK] = {
-          capabilities: { teamInjection: TEAM_INJECTION_UNAVAILABLE, enabled: false, reason: probe.reason }
-        }
-      }
+      publishUnavailable(service, probe.reason)
       ctx.logger.warn(
         `${PLUGIN}: team-mode injection unavailable (${probe.reason}); team-mode members keep the parent route`
       )
       return this
     }
-    const existing = service[CONTINUABLE_HOOK]
+    const existing = readHookSlot(service)
     if (existing !== undefined && existing.adapter !== undefined) {
       existing.resolve = resolveProvider
       this.installed = true
       this.reason = undefined
+      this.seams = Array.isArray(existing.installedSeams) ? existing.installedSeams : probe.seams
       return this
     }
-    const raw = service.startContinuable
-    const hadOwn = Object.prototype.hasOwnProperty.call(service, 'startContinuable')
-    const slot = { resolve: resolveProvider, raw, hadOwn, adapter: this }
-  const hook = async function startContinuable(spec) {
-    const request = spec !== null && typeof spec === 'object' ? spec.request : undefined
-    let injected
-    try {
-      const provider = slot.resolve()
-      if (
-        provider !== undefined &&
-        // Read live: `teamInjection` is volatile, so the Settings page can switch
-        // it without remounting this plugin.
-        valueOf(provider.options.config.teamInjection) !== false &&
-        request !== null &&
-        typeof request === 'object' &&
-        request.agentOptions === undefined
-      ) {
-        const picked = await provider.pickRoute(spec.label, true)
-        if (picked !== undefined) {
-          const agentOptions = { provider: picked.route.provider, model: picked.route.model }
-          if (picked.route.reasoningEffort !== undefined) agentOptions.reasoningEffort = picked.route.reasoningEffort
-          if (picked.route.maxTokens !== undefined) agentOptions.maxTokens = picked.route.maxTokens
-          request.agentOptions = agentOptions
-          injected = picked
-          ctx.logger.info(
-            `${PLUGIN}: team member label=${JSON.stringify(spec.label ?? null)} -> ` +
-              `${routeKey(picked.route)}${picked.route.reasoningEffort === undefined ? '' : ` effort=${picked.route.reasoningEffort}`} (${picked.source})`
-          )
-        }
+    const slot = { resolve: resolveProvider, seams: {}, adapter: this }
+    const wrapped = []
+    for (const seam of probe.seams) {
+      const raw = service[seam]
+      const hadOwn = Object.prototype.hasOwnProperty.call(service, seam)
+      const hook = this.makeHook(seam, slot)
+      try {
+        Object.defineProperty(service, seam, {
+          value: hook,
+          enumerable: false,
+          configurable: true,
+          writable: true
+        })
+      } catch (error) {
+        ctx.logger.warn(
+          `${PLUGIN}: cannot hook ctx.subagents.${seam} (${describeError(error)}); ` +
+            'that seam keeps the parent route'
+        )
+        continue
       }
-    } catch (error) {
-      ctx.logger.warn(`${PLUGIN}: team member route injection skipped: ${describeError(error)}`)
+      slot.seams[seam] = { raw, hadOwn, hook }
+      wrapped.push(seam)
     }
-    try {
-      return await raw.call(service, spec)
-    } catch (error) {
-      // A member that cannot start on the pinned route must not lose the whole
-      // delegation: drop the injection and retry once on the inherited route.
-      if (injected === undefined) throw error
-      const live = slot.resolve()
-      if (live === undefined || live.options.config.fallback !== true) throw error
-      delete request.agentOptions
-      ctx.logger.warn(
-        `${PLUGIN}: team member ${JSON.stringify(spec.label ?? null)} failed to start on ${routeKey(injected.route)} ` +
-          `(${describeError(error)}); retrying on the inherited route`
-      )
-      return raw.call(service, spec)
-    }
-  }
-    try {
-      Object.defineProperty(service, 'startContinuable', {
-        value: hook,
-        enumerable: false,
-        configurable: true,
-        writable: true
-      })
-    } catch (error) {
+    if (wrapped.length === 0) {
       this.installed = false
-      this.reason = `cannot define ctx.subagents.startContinuable (${describeError(error)})`
+      this.reason = `cannot define ${probe.seams.join(' / ')} on ctx.subagents`
+      publishUnavailable(service, this.reason)
       ctx.logger.warn(`${PLUGIN}: ${this.reason}; team-mode members keep the parent route`)
       return this
     }
+    slot.installedSeams = wrapped
     Object.defineProperty(slot, 'capabilities', { get: () => this.capabilities(), enumerable: true })
-    service[CONTINUABLE_HOOK] = slot
+    for (const symbol of HOOK_SYMBOLS) service[symbol] = slot
     this.installed = true
     this.reason = undefined
-    ctx.logger.info(`${PLUGIN}: team-mode hook installed on ctx.subagents.startContinuable`)
+    this.seams = wrapped
+    ctx.logger.info(`${PLUGIN}: team-mode hook installed on ctx.subagents.${wrapped.join(' + ')}`)
     return this
   }
 
-  /** Remove this generation's hook, restoring whatever ran before it. */
+  /** Remove this generation's hooks, restoring whatever ran before them. */
   dispose(resolveProvider) {
     const service = this.service
-    const current = service === null || service === undefined ? undefined : service[CONTINUABLE_HOOK]
+    const current = readHookSlot(service)
     if (current === undefined || current.resolve !== resolveProvider) return
-    if (current.hadOwn) service.startContinuable = current.raw
-    else delete service.startContinuable
-    delete service[CONTINUABLE_HOOK]
+    for (const [seam, entry] of Object.entries(current.seams ?? {})) {
+      // Someone else wrapped this seam after us: leave their wrapper alone.
+      if (Object.getOwnPropertyDescriptor(service, seam)?.value !== entry.hook) continue
+      if (entry.hadOwn) service[seam] = entry.raw
+      else delete service[seam]
+    }
+    for (const symbol of HOOK_SYMBOLS) {
+      if (service[symbol] === current) delete service[symbol]
+    }
     this.installed = false
+    this.seams = []
   }
 }
 
 /**
  * Public read-only view of the team-injection capability. Callers that hold the
- * `ctx.subagents` service can ask whether team-mode routing is live instead of
- * grepping the log.
+ * `ctx.subagents` service can ask whether team-mode routing is live — and which
+ * seam carries it — instead of grepping the log.
  */
 export function teamInjectionCapabilities(service) {
-  const slot = service === null || service === undefined ? undefined : service[CONTINUABLE_HOOK]
+  const slot = readHookSlot(service)
   if (slot === undefined) {
     return {
       teamInjection: TEAM_INJECTION_UNAVAILABLE,
       enabled: undefined,
+      seams: [],
       reason: 'the route-pin hook is not installed on this service'
     }
   }
@@ -875,6 +1009,7 @@ export function apply(ctx, config = {}) {
     onPinFailure: valueOf(config.onPinFailure) === 'inherit' ? 'inherit' : 'fail',
     autoWireAgency: valueOf(config.autoWireAgency) !== false,
     teamInjection: config.teamInjection,
+    overrideMemberRoute: config.overrideMemberRoute,
     // Volatile fields stay as their live accessors; the provider reads them per spawn.
     provider: config.provider,
     model: config.model,
@@ -941,6 +1076,7 @@ export function apply(ctx, config = {}) {
     settingsPath: normalized.settingsPath,
     fallback: normalized.fallback,
     teamInjection: normalized.teamInjection !== false,
+    overrideMemberRoute: normalized.overrideMemberRoute !== false,
     capabilities: capability
   })
   if (readinessError !== undefined) {

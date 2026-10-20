@@ -10,8 +10,9 @@
 
 - 注册一个包装 provider `pinned-account`，委托内置 `spawn`，在创建子 agent 前填入 `agentOptions`
 - 单发子代理走 `provider.start()`：包装 provider 直接生效
-- 团队模式成员不经过 `provider.start()`：在 `subagents.startContinuable()` 上挂一层钩子，把路由填进 `request.agentOptions`（可用 `teamInjection: false` 关闭）
-- **能力标志**：钩子探测结果会发布成 `{ teamInjection: 'installed' | 'unavailable', enabled, reason }`，调用方能读到「团队注入此刻可不可用」，而不是只靠日志猜
+- 团队模式成员不经过 `provider.start()`：在 `subagents.startActivation()`（当前契约）或 `startContinuable()`（旧名）上挂一层钩子，把路由填进 `request.agentOptions`（可用 `teamInjection: false` 关闭）
+- **覆盖团队成员自带路由**（`overrideMemberRoute`，默认开）：Agent Teams 会按自己的 `memberLlmProvider` / `memberModel` 先填好 `agentOptions`，只填「空槽」等于一个成员也钉不上；开着时钉住的路由优先，关掉则尊重调用方已选的路由（只补空槽）
+- **能力标志**：钩子探测结果会发布成 `{ teamInjection: 'installed' | 'unavailable', enabled, seams, reason }`，调用方能读到「团队注入此刻可不可用、挂在哪条缝上」，而不是只靠日志猜
 - **零配置可用**：没配路由、或路由指向一个当前不存在的 provider/model 时，子 agent 继承主 agent 的模型，召唤不会失败
 - **失败必提示**（`onPinFailure`，默认 `fail`）：你在设置页选过模型、它却跑不起来时，召唤直接报错并在错误里写明「哪个路由失败、为什么、去哪里改」，绝不静默换成别的模型；设成 `inherit` 才允许回退
 - **自动接线**（`autoWireAgency`，默认开）：挂载时把 profile 里 `agency-agents` 行的 `provider` 补成 `pinned-account`（改前留 `.bak-autowire-*` 备份，已接线则不动），装完不需要手改 YAML
@@ -23,7 +24,7 @@
 
 ```bash
 # 从 tarball
-dsh plugin --profile desktop add "./dsh-subagent-route-pin-0.7.0.tgz"
+dsh plugin --profile desktop add "./dsh-subagent-route-pin-0.8.0.tgz"
 
 # 从 npm（发布后）
 dsh plugin --profile desktop add "dsh-subagent-route-pin"
@@ -47,6 +48,7 @@ dsh plugin --profile desktop add "D:\\path\\to\\dsh-subagent-route-pin"
     reasoningEffort: ''
     strict: false
     teamInjection: true
+    overrideMemberRoute: true
     fallback: true
 ```
 
@@ -113,11 +115,11 @@ dsh-team-status --serve --port 7800
 
 1. 设置 → 专家模型 页面出现，底部显示「专家团引擎」
 2. 日志出现 `subagent-route-pin: provider "pinned-account" delegates to "spawn"`
-3. 日志出现 `subagent-route-pin: team-mode hook installed on ctx.subagents.startContinuable`
-4. 日志出现 `subagent-route-pin: capabilities {"teamInjection":"installed","enabled":true}`
+3. 日志出现 `subagent-route-pin: team-mode hook installed on ctx.subagents.startActivation`
+4. 日志出现 `subagent-route-pin: capabilities {"teamInjection":"installed","enabled":true,"seams":["startActivation"]}`
 5. 委派时出现 `subagent-route-pin: team member label="…" -> provider/model`
 
-**这五行是接口契约，不是装饰**：第 2 行说明 provider 包装还挂得上，第 3、4 行说明 `startContinuable` 这个缝还在，第 5 行说明注入实际生效。升级 DSH 后少任何一行，都说明上游接口变了，先别怪额度。
+**这五行是接口契约，不是装饰**：第 2 行说明 provider 包装还挂得上，第 3、4 行说明创建子代理的那条缝还在（`seams` 会写出实际包住的方法名），第 5 行说明注入实际生效。升级 DSH 后少任何一行，都说明上游接口变了，先别怪额度。
 
 这些行在哪看：`ctx.logger.info` 只进 DSH 进程控制台（GUI 的开发者控制台 / 终端 stdout），**不落盘**。`~/.dsh/logs/` 下只有启动**失败**时的诊断 dump，正常启动不写日志文件——所以别去那里找。
 
@@ -134,18 +136,18 @@ npm run ready         # 只看盘上的就绪记录，不跑测试
 {
   "schema": 1,
   "plugin": "subagent-route-pin",
-  "version": "0.5.0",
-  "at": "2026-10-19T14:11:28.596Z",
+  "version": "0.8.0",
+  "at": "2026-10-20T12:04:11.208Z",
   "mounted": true,
   "providerName": "pinned-account",
   "baseProvider": "spawn",
   "fallback": true,
   "teamInjection": true,
-  "capabilities": { "teamInjection": "installed", "enabled": true }
+  "capabilities": { "teamInjection": "installed", "enabled": true, "seams": ["startActivation"] }
 }
 ```
 
-`test/logs.mjs` 校验：插件身份、版本与本地 `package.json` 一致、是否挂载、能力标志、回退开关、`providerName -> baseProvider`、记录龄（超过 7 天提示重启 DSH）。`--strict` 时 `teamInjection: 'unavailable'` 直接判失败——发版前该用这个。
+`test/logs.mjs` 校验：插件身份、版本与本地 `package.json` 一致、是否挂载、能力标志、**实际挂住的接缝**（`seams` 里没有 `startActivation` 会 WARN：那说明这个构建可能根本不调被包住的方法）、回退开关、`providerName -> baseProvider`、记录龄（超过 7 天提示重启 DSH）。`--strict` 时 `teamInjection: 'unavailable'` 直接判失败——发版前该用这个。
 
 有控制台输出时还能一起验那五行：
 
@@ -162,7 +164,8 @@ node test/logs.mjs --log captured-console.txt
 | 场景 | 行为 | 日志 |
 | --- | --- | --- |
 | 单发子代理，`pinned-account` 的 `start()` 报错 | 去掉注入的路由，用调用方本来的路由重试一次 | `pinned route … failed to start (…); retrying on the inherited route …` |
-| 团队成员，`startContinuable()` 报错 | 删掉 `request.agentOptions`，用继承路由重试一次 | `team member … failed to start on …; retrying on the inherited route` |
+| 团队成员，创建调用报错 | 把 `request.agentOptions` 还原成调用方原本要的那份（Agent Teams 自己的成员路由），重试一次 | `team member … failed to start on …; retrying on the requested route …` |
+| 团队成员本来没带路由（被插件填的） | 删掉注入的 `agentOptions`，用继承路由重试一次 | `…; retrying on the inherited route` |
 | 重试后仍然失败 | 抛出原始错误，不吞 | — |
 | 注入的路由和继承路由本来就一样 | 不重试（重试等于再撞一次同一额度） | — |
 
@@ -174,9 +177,9 @@ node test/logs.mjs --log captured-console.txt
 
 | DSH / `@deepseek-ai/dsh-tool-subagent` | 状态 | 说明 |
 | --- | --- | --- |
-| `0.2.1-rc.2` | ✅ 已验证 | 当前 `peerDependencies` 钉住的版本，79 项断言全绿 |
-| `0.2.0-rc.x` | ❓ 未验证 | 接口面看起来一致，但没跑过；装了会看到 peer 警告 |
-| `>= 0.3.0` | ⚠️ 预期不兼容 | 上游一旦改动 provider / `startContinuable` 签名，第 2–5 行日志会先缺，插件按能力标志降级 |
+| `0.2.1-rc.2` | ✅ 已验证 | 当前 `peerDependencies` 钉住的版本，107 项断言全绿；本机构建只有 `startActivation`（无 `startContinuable`），插件按 `startActivation` 注入 |
+| `0.2.0-rc.x` | ❓ 未验证 | 接口面看起来一致（旧版走 `startContinuable`），但没跑过；装了会看到 peer 警告 |
+| `>= 0.3.0` | ⚠️ 预期不兼容 | 上游一旦改动 provider 或创建子代理的接缝，第 2–5 行日志会先缺，插件按能力标志降级 |
 
 `peerDependencies` 钉死版本是刻意的：**升级前 npm/pnpm 就会警告**，把「升级完发现坏了」提前成「装的时候就知道要验」。想放宽就改 `package.json` 的 `peerDependencies`，但改完请按上面的测试跑一遍再发版。
 
@@ -184,7 +187,8 @@ node test/logs.mjs --log captured-console.txt
 
 | 依赖 | 说明 |
 | --- | --- |
-| `ctx.subagents.registerProvider` / `startContinuable` | 缺失时置能力标志 `teamInjection: 'unavailable'` 并告警，不阻断 profile 启动 |
+| `ctx.subagents.registerProvider` | 缺失时置能力标志 `teamInjection: 'unavailable'` 并告警，不阻断 profile 启动 |
+| `ctx.subagents.startActivation` / `startContinuable` | 至少一条存在且可被定义 own property；两条都在时优先 `startActivation`（当前构建的原生委派与 Agent Teams 都走它），两条都不在则置 `unavailable` 并退化为「仅单发子代理可控」 |
 | `@deepseek-ai/dsh-tool-subagent` 的 provider 接口 | 能力表必须声明 `agentOptions`；内置 `spawn` 自带 |
 | 浏览器侧 `configForms` / `slots` / `locale` / `remote.session.modelCatalog` | 页面用；缺失时卡片显示「不可用」状态 |
 | 设置行 patch 语义 | 整行替换 config，不是合并 |
@@ -194,26 +198,27 @@ node test/logs.mjs --log captured-console.txt
 ```js
 import { teamInjectionCapabilities } from 'dsh-subagent-route-pin'
 
-// { teamInjection: 'installed' | 'unavailable', enabled?: boolean, reason?: string }
+// { teamInjection: 'installed' | 'unavailable', enabled?: boolean, seams: string[], reason?: string }
 const capability = teamInjectionCapabilities(ctx.subagents)
 if (capability.teamInjection === 'unavailable') {
   // 团队成员会保持父路由 —— 这里决定要不要降级/提示用户
 }
+// seams 是实际包住的方法名：['startActivation'] 表示当前构建真的会走到它
 ```
 
-同一份结果也挂在 `ctx.subagents[Symbol.for('dsh-subagent-route-pin.continuable-hook')].capabilities` 上。
+同一份结果也挂在 `ctx.subagents[Symbol.for('dsh-subagent-route-pin.team-hook')].capabilities` 上；0.8 之前的 `…continuable-hook` 符号仍然读写，旧调用方不用改。
 
-`teamInjection` 依赖 `startContinuable` 可被定义 own property；若 DSH 后续冻结该服务对象，插件置 `unavailable` 并退化为「仅单发子代理可控」。
+`teamInjection` 依赖接缝方法可被定义 own property；若 DSH 后续冻结该服务对象，插件置 `unavailable` 并退化为「仅单发子代理可控」。
 
 ## 测试
 
 ```bash
-node test/run.mjs        # 79 项断言，不需要 DSH 在跑
+node test/run.mjs        # 107 项断言，不需要 DSH 在跑
 node test/logs.mjs       # 检查真实启动留下的就绪记录
 npm run verify           # 两个一起，且 --strict
 ```
 
-79 项断言：路由优先级、文件热读、strict 校验、团队注入、已有路由不覆盖、开关关闭、缺路由不阻断、dispose 还原、重复挂载换路由、能力标志（installed / unavailable / 缺 `startContinuable`）、启动失败回退（单发 / 团队 / 关闭开关 / 重试仍失败 / 同路由不重试）、日志契约、就绪记录（正常挂载 / 缺服务 / 版本一致）。
+107 项断言：路由优先级、文件热读、strict 校验、团队注入、覆盖团队成员自带路由（默认覆盖 / `overrideMemberRoute: false` 时尊重 / 保留调用方其他字段 / 丢弃旧路由的 effort / 覆盖失败退回调用方原路由）、开关关闭、缺路由不阻断、dispose 还原、重复挂载换路由、能力标志（installed / unavailable / 无任何接缝）、多接缝（只有 `startActivation` / 只有 `startContinuable` / 两条都在时优先前者且只注入一次）、启动失败回退（单发 / 团队 / 关闭开关 / 重试仍失败 / 同路由不重试）、日志契约、就绪记录（正常挂载 / 缺服务 / 版本一致）。
 
 `test/run.mjs` 证明的是**插件逻辑没坏**；`test/logs.mjs` 证明的是**它在这个 DSH 构建里还挂着**。两件事会分别失败，上游接口变更先体现在后者。
 
@@ -222,12 +227,12 @@ npm run verify           # 两个一起，且 --strict
 升级 DSH 后按这个顺序走，别跳步：
 
 ```bash
-node test/run.mjs                 # 1. 逻辑层：79 项还绿吗
+node test/run.mjs                 # 1. 逻辑层：107 项还绿吗
 # 2. 重启 DSH（只改插件不用，改 DSH 本体必须）
 npm run ready                     # 3. 挂载层：就绪记录还是这次启动写的吗
 ```
 
-第 3 步读到 `capabilities.teamInjection: "unavailable"` 就是上游把 `startContinuable` 动了——此时单发子代理仍可控，团队模式成员退回父路由。把 `peerDependencies` 和兼容矩阵一起对一遍，再决定是适配还是回滚。
+第 3 步读到 `capabilities.teamInjection: "unavailable"` 就是上游把创建子代理的接缝动了——此时单发子代理仍可控，团队模式成员退回父路由。读到 `seams` 里没有 `startActivation`，说明钩子包住的方法当前构建不调用，同样是接口变了。把 `peerDependencies` 和兼容矩阵一起对一遍，再决定是适配还是回滚。
 
 ## 发布
 

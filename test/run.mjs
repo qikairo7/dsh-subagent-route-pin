@@ -19,7 +19,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, teamInjectionCapabilities, wireAgencyProvider } from '../index.js'
 
-const HOOK = Symbol.for('dsh-subagent-route-pin.continuable-hook')
+const HOOK = Symbol.for('dsh-subagent-route-pin.team-hook')
+// Pre-0.8 path, still published so a caller that learned it keeps working.
+const LEGACY_HOOK = Symbol.for('dsh-subagent-route-pin.continuable-hook')
 
 const dir = mkdtempSync(join(tmpdir(), 'route-pin-'))
 const settingsPath = join(dir, 'routes.json')
@@ -45,10 +47,12 @@ function makeHarness(config, extraCtx = {}) {
   }
   const registered = []
   const teamCalls = []
-  // startContinuable lives on a prototype on purpose: the team hook shadows it
-  // with an own property, so the dispose path can be asserted by deleting it.
+  // Mirrors a current DSH build: `SubagentRuntime` exposes `startActivation` and
+  // has no `startContinuable`. It lives on a prototype on purpose: the team hook
+  // shadows it with an own property, so the dispose path can be asserted by
+  // deleting it.
   const service = Object.create({
-    async startContinuable(spec) {
+    async startActivation(spec) {
       teamCalls.push(spec)
       return { ok: true, spec }
     }
@@ -324,30 +328,114 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
 {
   const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: 'medium' })
   const spec = { childId: 'c1', provider: 'pinned-account', label: '问卷设计师', request: { prompt: 'do', parent: {} } }
-  await harness.service.startContinuable(spec)
+  await harness.service.startActivation(spec)
   const agentOptions = spec.request.agentOptions
   check('team member route injected', agentOptions?.provider === 'deepseek-account' && agentOptions?.model === 'deepseek-flash', JSON.stringify(agentOptions))
   check('team member effort injected', agentOptions?.reasoningEffort === 'medium')
-  check('underlying startContinuable still called', harness.teamCalls.length === 1)
+  check('underlying startActivation still called', harness.teamCalls.length === 1)
   check('team member logged', harness.logs.some(([kind, message]) => kind === 'info' && message.includes('team member')))
 }
 
-// --- 17. a route already on the request wins (Agent Teams pins its own) ---
+// --- 17. Agent Teams' own member route is overridden by default -----------
 {
   const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
   const spec = {
     label: 'x',
     request: { prompt: 'do', parent: {}, agentOptions: { provider: 'our-free-model', model: 'mimo-v2.6-flash-free' } }
   }
-  await harness.service.startContinuable(spec)
-  check('existing member route untouched', spec.request.agentOptions.model === 'mimo-v2.6-flash-free', JSON.stringify(spec.request.agentOptions))
+  await harness.service.startActivation(spec)
+  check(
+    'existing member route overridden',
+    spec.request.agentOptions.provider === 'deepseek-account' && spec.request.agentOptions.model === 'deepseek-flash',
+    JSON.stringify(spec.request.agentOptions)
+  )
+}
+
+// --- 17b. overrideMemberRoute: false keeps the caller's own route ---------
+{
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash', overrideMemberRoute: false })
+  const spec = {
+    label: 'x',
+    request: { prompt: 'do', parent: {}, agentOptions: { provider: 'our-free-model', model: 'mimo-v2.6-flash-free' } }
+  }
+  await harness.service.startActivation(spec)
+  check(
+    'existing member route untouched when the override is off',
+    spec.request.agentOptions.provider === 'our-free-model' && spec.request.agentOptions.model === 'mimo-v2.6-flash-free',
+    JSON.stringify(spec.request.agentOptions)
+  )
+}
+
+// --- 17c. an overridden route keeps the caller's extra fields -------------
+{
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  const spec = {
+    label: 'x',
+    request: { prompt: 'do', parent: {}, agentOptions: { provider: 'our-free-model', model: 'mimo', maxTokens: 4096 } }
+  }
+  await harness.service.startActivation(spec)
+  check(
+    'override keeps unrelated agentOptions',
+    spec.request.agentOptions.maxTokens === 4096 && spec.request.agentOptions.provider === 'deepseek-account',
+    JSON.stringify(spec.request.agentOptions)
+  )
+}
+
+// --- 17d. the pinned route drops a stale effort ---------------------------
+{
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  const spec = {
+    label: 'x',
+    request: { prompt: 'do', parent: {}, agentOptions: { provider: 'our-free-model', model: 'mimo', reasoningEffort: 'low' } }
+  }
+  await harness.service.startActivation(spec)
+  check(
+    'override drops effort the pinned route did not ask for',
+    spec.request.agentOptions.reasoningEffort === undefined,
+    JSON.stringify(spec.request.agentOptions)
+  )
+}
+
+// --- 17e. a failed override falls back to the requested route, not none ---
+{
+  const seen = []
+  const service = Object.create({
+    async startActivation(spec) {
+      seen.push(spec.request.agentOptions)
+      if (spec.request.agentOptions?.provider === 'deepseek-account') throw new Error('429 quota exhausted')
+      return { ok: true }
+    }
+  })
+  service.getProvider = () => undefined
+  service.registerProvider = () => () => {}
+  const logs = []
+  const ctx = {
+    logger: { info: (message) => logs.push(['info', message]), warn: (message) => logs.push(['warn', message]) },
+    subagents: service,
+    llm: {
+      listProviders: () => [{ id: 'deepseek-account' }],
+      async listModels() {
+        return [{ id: 'deepseek-flash' }]
+      }
+    }
+  }
+  writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
+  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+  const spec = {
+    label: 'x',
+    request: { prompt: 'do', parent: {}, agentOptions: { provider: 'our-free-model', model: 'mimo-v2.6-flash-free' } }
+  }
+  const result = await service.startActivation(spec)
+  check('failed override retries on the requested route', seen.length === 2 && seen[1]?.provider === 'our-free-model' && seen[1]?.model === 'mimo-v2.6-flash-free', JSON.stringify(seen))
+  check('failed override keeps the member alive', result.ok === true)
+  check('failed override says requested, not inherited', logs.some(([, message]) => message.includes('retrying on the requested route')))
 }
 
 // --- 18. teamInjection: false is an off switch ---------------------------
 {
   const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash', teamInjection: false })
   const spec = { label: 'x', request: { prompt: 'do', parent: {} } }
-  await harness.service.startContinuable(spec)
+  await harness.service.startActivation(spec)
   check('teamInjection false leaves the member on the parent route', spec.request.agentOptions === undefined)
 }
 
@@ -357,7 +445,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   const spec = { label: 'x', request: { prompt: 'do', parent: {} } }
   let threw
   try {
-    await harness.service.startContinuable(spec)
+    await harness.service.startActivation(spec)
   } catch (error) {
     threw = error
   }
@@ -371,7 +459,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   const effects = []
   const logs = []
   const service = Object.create({
-    async startContinuable(spec) {
+    async startActivation(spec) {
       return { ok: true, spec }
     }
   })
@@ -388,14 +476,14 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   }
   writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
-  check('hook is an own property of the service', Object.prototype.hasOwnProperty.call(service, 'startContinuable'))
+  check('hook is an own property of the service', Object.prototype.hasOwnProperty.call(service, 'startActivation'))
   const spec = { label: 'x', request: { prompt: 'do', parent: {} } }
-  await service.startContinuable(spec)
+  await service.startActivation(spec)
   check('hook works on a prototype-provided method', spec.request.agentOptions?.model === 'deepseek-flash', JSON.stringify(spec.request.agentOptions))
   for (const callback of effects) callback()()
-  check('dispose deletes the own property', Object.prototype.hasOwnProperty.call(service, 'startContinuable') === false)
+  check('dispose deletes the own property', Object.prototype.hasOwnProperty.call(service, 'startActivation') === false)
   const after = { label: 'x', request: { prompt: 'do', parent: {} } }
-  await service.startContinuable(after)
+  await service.startActivation(after)
   check('prototype method restored', after.request.agentOptions === undefined)
 }
 
@@ -403,7 +491,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
 {
   const effects = []
   const logs = []
-  const service = Object.create({ async startContinuable(spec) { return { ok: true, spec } } })
+  const service = Object.create({ async startActivation(spec) { return { ok: true, spec } } })
   service.getProvider = () => undefined
   service.registerProvider = () => () => {}
   const ctx = {
@@ -424,7 +512,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
   apply(ctx, { settingsPath, readinessPath, provider: 'our-free-model', model: 'deepseek-v4.1-flash-free' })
   const spec = { label: 'x', request: { prompt: 'do', parent: {} } }
-  await service.startContinuable(spec)
+  await service.startActivation(spec)
   check('remount swaps the resolver', spec.request.agentOptions?.model === 'deepseek-v4.1-flash-free', JSON.stringify(spec.request.agentOptions))
   check('hook installed exactly once', logs.filter(([, message]) => message.includes('team-mode hook installed')).length === 1)
 }
@@ -438,6 +526,84 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   check('capability: no reason when installed', capability.reason === undefined, JSON.stringify(capability))
   const published = harness.service[HOOK].capabilities
   check('capability published on the service symbol', published.teamInjection === 'installed', JSON.stringify(published))
+  check('capability: names the wrapped seam', JSON.stringify(capability.seams) === '["startActivation"]', JSON.stringify(capability.seams))
+  const legacy = harness.service[LEGACY_HOOK]
+  check('capability: the pre-0.8 symbol still resolves', legacy !== undefined && legacy.capabilities.teamInjection === 'installed')
+}
+
+// --- 22b. a build that only has the older seam still gets injected ------
+{
+  const seen = []
+  const service = Object.create({
+    async startContinuable(spec) {
+      seen.push(spec.request.agentOptions)
+      return { ok: true }
+    }
+  })
+  service.getProvider = () => undefined
+  service.registerProvider = () => () => {}
+  const logs = []
+  const ctx = {
+    logger: { info: (message) => logs.push(['info', message]), warn: (message) => logs.push(['warn', message]) },
+    subagents: service,
+    llm: {
+      listProviders: () => [{ id: 'deepseek-account' }],
+      async listModels() {
+        return [{ id: 'deepseek-flash' }]
+      }
+    }
+  }
+  writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
+  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+  const capability = teamInjectionCapabilities(service)
+  check('legacy seam: reported as the wrapped seam', JSON.stringify(capability.seams) === '["startContinuable"]', JSON.stringify(capability.seams))
+  await service.startContinuable({ label: 'x', request: { prompt: 'do', parent: {} } })
+  check('legacy seam: route injected', seen[0]?.model === 'deepseek-flash', JSON.stringify(seen))
+}
+
+// --- 22c. both seams present: startActivation wins, no double injection --
+{
+  const order = []
+  const service = Object.create({
+    async startActivation(spec) {
+      order.push(['activation', spec.request.agentOptions])
+      // A real runtime dispatches to the older method internally, already carrying
+      // the injected route; the inner hook must see it and leave it alone.
+      return service.startContinuable(spec)
+    },
+    async startContinuable(spec) {
+      order.push(['continuable', spec.request.agentOptions])
+      return { ok: true }
+    }
+  })
+  service.getProvider = () => undefined
+  service.registerProvider = () => () => {}
+  const logs = []
+  const ctx = {
+    logger: { info: (message) => logs.push(['info', message]), warn: (message) => logs.push(['warn', message]) },
+    subagents: service,
+    llm: {
+      listProviders: () => [{ id: 'deepseek-account' }],
+      async listModels() {
+        return [{ id: 'deepseek-flash' }]
+      }
+    }
+  }
+  writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
+  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+  const capability = teamInjectionCapabilities(service)
+  check(
+    'both seams: reported most-preferred first',
+    JSON.stringify(capability.seams) === '["startActivation","startContinuable"]',
+    JSON.stringify(capability.seams)
+  )
+  await service.startActivation({ label: 'x', request: { prompt: 'do', parent: {} } })
+  check('both seams: route injected once', order[0][1]?.model === 'deepseek-flash' && order[1][1]?.model === 'deepseek-flash', JSON.stringify(order))
+  check(
+    'both seams: one injection log line',
+    logs.filter(([, message]) => message.includes('team member label=')).length === 1,
+    JSON.stringify(logs.filter(([, message]) => message.includes('team member label=')))
+  )
 }
 
 // --- 23. a missing seam is a state, not just a warning -------------------
@@ -457,8 +623,8 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
   const capability = teamInjectionCapabilities(service)
-  check('capability: unavailable without startContinuable', capability.teamInjection === 'unavailable', JSON.stringify(capability))
-  check('capability: names the missing seam', String(capability.reason).includes('startContinuable'), String(capability.reason))
+  check('capability: unavailable without a creation seam', capability.teamInjection === 'unavailable', JSON.stringify(capability))
+  check('capability: names the missing seams', String(capability.reason).includes('startActivation') && String(capability.reason).includes('startContinuable'), String(capability.reason))
   check('capability: disabled is reported as off', capability.enabled === false, JSON.stringify(capability))
   check(
     'capability: one unavailable warning',
@@ -588,7 +754,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
 {
   const seen = []
   const service = Object.create({
-    async startContinuable(spec) {
+    async startActivation(spec) {
       seen.push(spec.request.agentOptions)
       if (spec.request.agentOptions !== undefined) throw new Error('quota exceeded')
       return { ok: true }
@@ -609,7 +775,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   }
   writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
-  const result = await service.startContinuable({ label: 'x', request: { prompt: 'do', parent: {} } })
+  const result = await service.startActivation({ label: 'x', request: { prompt: 'do', parent: {} } })
   check('team fallback: retried once without the pin', seen.length === 2 && seen[0]?.model === 'deepseek-flash' && seen[1] === undefined, JSON.stringify(seen))
   check('team fallback: member still starts', result.ok === true)
   check('team fallback: warned', logs.some(([, message]) => message.includes('retrying on the inherited route')))
@@ -618,10 +784,10 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
 // --- 27. the three log lines are a contract -----------------------------
 {
   const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
-  await harness.service.startContinuable({ label: 'Researcher', request: { prompt: 'do', parent: {} } })
+  await harness.service.startActivation({ label: 'Researcher', request: { prompt: 'do', parent: {} } })
   const messages = harness.logs.map(([, message]) => message).join('\n')
   check('log contract: provider delegates', /provider "pinned-account" delegates to "spawn"/.test(messages))
-  check('log contract: hook installed', /team-mode hook installed on ctx\.subagents\.startContinuable/.test(messages))
+  check('log contract: hook installed', /team-mode hook installed on ctx\.subagents\.startActivation/.test(messages))
   check(
     'log contract: team member -> provider/model',
     /team member label="Researcher" -> deepseek-account\/deepseek-flash/.test(messages)
@@ -640,6 +806,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   check('readiness: capabilities installed', record.capabilities.teamInjection === 'installed', JSON.stringify(record.capabilities))
   check('readiness: route reported', record.providerName === 'pinned-account' && record.baseProvider === 'spawn')
   check('readiness: fallback reported', record.fallback === true)
+  check('readiness: overrideMemberRoute reported', record.overrideMemberRoute === true, String(record.overrideMemberRoute))
   check('readiness: teamInjection reported', record.teamInjection === true)
   check('readiness: harness still usable', harness.provider !== undefined)
 }

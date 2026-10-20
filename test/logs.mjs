@@ -33,7 +33,7 @@ const LOCAL_MANIFEST = new URL('../package.json', import.meta.url)
 /** Console contract: these lines are promises about the DSH seam. */
 const CONSOLE_LINES = [
   { key: 'provider delegates', required: true, test: (text) => new RegExp(`${PREFIX} provider ".*" delegates to ".*"`).test(text) },
-  { key: 'hook installed', required: true, test: (text) => text.includes(`${PREFIX} team-mode hook installed on ctx.subagents.startContinuable`) },
+  { key: 'hook installed', required: true, test: (text) => new RegExp(`${PREFIX} team-mode hook installed on ctx\\.subagents\\.(startActivation|startContinuable)`).test(text) },
   { key: 'capabilities published', required: true, test: (text) => text.includes(`${PREFIX} capabilities {"teamInjection":"`) },
   { key: 'team member -> provider/model', required: false, test: (text) => text.includes(`${PREFIX} team member label=`) }
 ]
@@ -91,6 +91,13 @@ else {
 const capability = record.capabilities ?? {}
 if (capability.teamInjection === 'installed') {
   report('ok', `team injection ${capability.enabled === false ? 'installed but switched off' : 'installed'}`)
+  // Which method the hook actually wrapped. `startContinuable` here on a build
+  // whose runtime only calls `startActivation` would be a silent no-op, so the
+  // seam is part of the contract, not a debug detail.
+  const seams = Array.isArray(capability.seams) ? capability.seams : []
+  if (seams.includes('startActivation')) report('ok', `seam ${seams.join(' + ')}`)
+  else if (seams.length === 0) report('WARN', 'seam', 'the record predates seam reporting; restart DSH')
+  else report('WARN', `seam ${seams.join(' + ')}`, 'no startActivation: this build may not call the wrapped seam')
 } else if (flag('--strict')) {
   report('MISS', 'team injection', capability.reason)
   missing += 1
@@ -99,6 +106,15 @@ if (capability.teamInjection === 'installed') {
 }
 
 report(record.fallback === true ? 'ok' : 'WARN', `fallback ${record.fallback === true ? 'on' : 'off'}`)
+if (record.overrideMemberRoute === undefined) {
+  report('WARN', 'member override', 'the record predates this field; restart DSH')
+} else {
+  report(
+    record.overrideMemberRoute === true ? 'ok' : 'WARN',
+    `member override ${record.overrideMemberRoute === true ? 'on' : 'off'}`,
+    record.overrideMemberRoute === true ? undefined : 'Agent Teams members keep their own memberLlmProvider'
+  )
+}
 report('ok', `fallback/route: ${record.providerName} -> ${record.baseProvider}`)
 
 if (record.at !== undefined) {
