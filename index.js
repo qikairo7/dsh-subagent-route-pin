@@ -44,7 +44,7 @@
 
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const name = 'subagent-route-pin'
@@ -80,6 +80,13 @@ const DEFAULT_SETTINGS_PATH = join(homedir(), '.dsh', 'subagent-route-pin.json')
  * record per boot, overwritten each time.
  */
 const DEFAULT_READINESS_PATH = join(homedir(), '.dsh', 'subagent-route-pin.ready.json')
+
+/**
+ * Last delegated run, overwritten on every start. The readiness record answers
+ * "did the plugin mount"; this one answers "did the route I picked actually work",
+ * which is the question a user asks after the model failed.
+ */
+const RUN_RECORD_NAME = 'subagent-route-pin.last-run.json'
 
 /** Plugin version, read once; a missing package.json is not fatal. */
 const PLUGIN_VERSION = (() => {
@@ -157,6 +164,12 @@ function makeConfig(z) {
       readinessPath: z.string().default(DEFAULT_READINESS_PATH),
       strict: z.boolean().default(false),
       fallback: z.boolean().default(true),
+      // What a *configured* route does when it cannot run. 'fail' (default) makes
+      // the summon error visible; 'inherit' silently falls back to the parent route.
+      onPinFailure: z.string().default('fail'),
+      // Fill the agency-agents row's provider in on mount so a fresh install needs
+      // no hand-edited YAML. Off only when someone wants to wire it themselves.
+      autoWireAgency: z.boolean().default(true),
       teamInjection: z.boolean().default(true).volatile(),
       provider: z.string().volatile(),
       model: z.string().volatile(),
@@ -184,6 +197,82 @@ function text(value, field, fallback) {
     throw new Error(`${PLUGIN}: ${field} must be a non-empty string`)
   }
   return value.trim()
+}
+
+/**
+ * Point the agency-agents row at this provider.
+ *
+ * Agency only reaches this plugin when its row says `provider: pinned-account`;
+ * leaving that as a hand edit is the step people skip. The rewrite is surgical
+ * (one `provider:` line inside the agency block), the original file is backed up
+ * once per change, and it is a no-op when the row is already wired or absent.
+ */
+export function wireAgencyProvider(profileRoot, providerName, logger) {
+  const patchPath = join(profileRoot, 'cordis.patch.yml')
+  let source
+  try {
+    source = readFileSync(patchPath, 'utf8')
+  } catch {
+    return { changed: false, reason: 'no cordis.patch.yml' }
+  }
+  const eol = source.includes('\r\n') ? '\r\n' : '\n'
+  const lines = source.split(/\r?\n/)
+  const start = lines.findIndex((line) => /^-\s+id:\s*agency-agents\s*$/.test(line))
+  if (start < 0) return { changed: false, reason: 'no agency-agents row' }
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^-\s+id:/.test(lines[i])) {
+      end = i
+      break
+    }
+  }
+  const block = lines.slice(start, end)
+  const providerIndex = block.findIndex((line) => /^\s+provider:\s*\S/.test(line))
+  if (providerIndex >= 0) {
+    if (block[providerIndex].trim() === `provider: ${providerName}`) return { changed: false, reason: 'already wired' }
+    block[providerIndex] = block[providerIndex].replace(/provider:\s*\S+.*$/, `provider: ${providerName}`)
+  } else {
+    const configIndex = block.findIndex((line) => /^\s+config:\s*$/.test(line))
+    if (configIndex < 0) return { changed: false, reason: 'no config block' }
+    const indent = (block[configIndex].match(/^\s*/) ?? [''])[0] + '  '
+    block.splice(configIndex + 1, 0, `${indent}provider: ${providerName}`)
+  }
+  const next = [...lines.slice(0, start), ...block, ...lines.slice(end)].join(eol)
+  try {
+    writeFileSync(`${patchPath}.bak-autowire-${Date.now()}`, source, 'utf8')
+    writeFileSync(patchPath, next, 'utf8')
+  } catch (error) {
+    return { changed: false, reason: describeError(error) }
+  }
+  logger?.info?.(`${PLUGIN}: agency-agents row routes through "${providerName}" (${patchPath})`)
+  return { changed: true, patchPath }
+}
+
+/** Wire every profile that actually depends on agency-agents. Never throws. */
+function wireAgencyProfiles(providerName, logger) {
+  let profiles = []
+  try {
+    profiles = readdirSync(join(homedir(), '.dsh', 'profiles'), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+  } catch {
+    return
+  }
+  for (const profile of profiles) {
+    const root = join(homedir(), '.dsh', 'profiles', profile)
+    try {
+      const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+      const deps = { ...(manifest.dependencies ?? {}), ...(manifest.devDependencies ?? {}) }
+      if (deps['@michengai/dsh-agency-agents'] === undefined) continue
+    } catch {
+      continue
+    }
+    try {
+      wireAgencyProvider(root, providerName, logger)
+    } catch (error) {
+      logger?.warn?.(`${PLUGIN}: cannot wire the agency row in ${root}: ${describeError(error)}`)
+    }
+  }
 }
 
 /**
@@ -438,6 +527,20 @@ class RoutePinProvider {
    * `soft: true` (team mode) additionally swallows a strict-mode throw, because a
    * broken route must not take member creation down with it.
    */
+  /** Persist the outcome of one delegation; never throws. */
+  recordRun(entry) {
+    const { config } = this.options
+    try {
+      writeFileSync(
+        join(dirname(config.readinessPath), RUN_RECORD_NAME),
+        `${JSON.stringify({ at: new Date().toISOString(), ...entry }, null, 2)}\n`,
+        'utf8'
+      )
+    } catch {
+      /* a read-only home must not break a delegation */
+    }
+  }
+
   async pickRoute(label, soft = false) {
     const { ctx, config } = this.options
     const strict = config.strict === true
@@ -450,7 +553,12 @@ class RoutePinProvider {
       const problem = await this.checkRoute(route)
       if (problem !== undefined) {
         const message = `${PLUGIN}: ${problem} (route came from ${source})`
-        if (strict) throw new Error(message)
+        // A route only exists here because somebody configured it, so an unusable
+        // one is a configuration mistake the user has to see; running on another
+        // model silently is the one outcome they must never discover from a log.
+        if (strict || config.onPinFailure !== 'inherit') {
+          throw Object.assign(new Error(message), { routeFailure: true })
+        }
         if (configured === undefined) {
           ctx.logger.warn(`${message}; no fallback route, so the child inherits the parent model`)
           return undefined
@@ -461,6 +569,9 @@ class RoutePinProvider {
       }
       return { route, source }
     } catch (error) {
+      // A configured-but-unusable route is a finding, not a missing optional: it
+      // must reach the caller (and the user) instead of degrading like a bare install.
+      if (error !== null && typeof error === 'object' && error.routeFailure === true && soft !== true) throw error
       if (strict && soft !== true) throw error
       ctx.logger.warn(
         `${PLUGIN}: no usable route, the child inherits the parent model: ${error instanceof Error ? error.message : String(error)}`
@@ -491,14 +602,31 @@ class RoutePinProvider {
         `${route.reasoningEffort === undefined ? '' : ` effort=${route.reasoningEffort}`} (${source})`
     )
     try {
-      return await base.start({ ...request, agentOptions })
+      const handle = await base.start({ ...request, agentOptions })
+      this.recordRun({ label, route, outcome: 'pinned' })
+      return handle
     } catch (error) {
       // The pinned route is the one most likely to run dry (a free lane), so a
       // start-time failure must not be the end of the delegation: retry once on
       // whatever route the caller already had (normally the parent's).
       const inherited = request.agentOptions
       const sameRoute = inherited !== undefined && inherited.provider === route.provider && inherited.model === route.model
-      if (config.fallback !== true || sameRoute) throw error
+      const canRetry = config.fallback !== false && config.onPinFailure === 'inherit' && !sameRoute
+      this.recordRun({ label, route, outcome: 'failed', reason: describeError(error) })
+      if (!canRetry) {
+        // Loud by default. The user picked this route on purpose; running the child
+        // on some other model without saying so is the exact failure this plugin
+        // exists to prevent, so the summon error is the honest surface.
+        ctx.logger.error(
+          `${PLUGIN}: pinned route ${routeKey(route)} failed for label=${JSON.stringify(label ?? null)}: ${describeError(error)}`
+        )
+        const failure = new Error(
+          `专家模型 ${routeKey(route)} 调用失败：${describeError(error)}\n` +
+            `处理：打开 设置 → 专家模型 换一个可用模型（或在插件行把 onPinFailure 设为 inherit，允许失败时回退到主 agent 的模型）。`
+        )
+        failure.cause = error
+        throw failure
+      }
       ctx.logger.warn(
         `${PLUGIN}: pinned route ${routeKey(route)} failed to start (${describeError(error)}); ` +
           `retrying on the inherited route ${inherited === undefined ? '(parent default)' : routeKey(inherited)}`
@@ -743,6 +871,9 @@ export function apply(ctx, config = {}) {
     strict: valueOf(config.strict) === true,
     // Default on: a dead pinned lane must degrade, not fail the delegation.
     fallback: valueOf(config.fallback) !== false,
+    // 'fail' (default): a route the user picked must never die silently.
+    onPinFailure: valueOf(config.onPinFailure) === 'inherit' ? 'inherit' : 'fail',
+    autoWireAgency: valueOf(config.autoWireAgency) !== false,
     teamInjection: config.teamInjection,
     // Volatile fields stay as their live accessors; the provider reads them per spawn.
     provider: config.provider,
@@ -779,6 +910,14 @@ export function apply(ctx, config = {}) {
       ctx.logger.warn(
         `${PLUGIN}: cannot scope the provider disposer: ${error instanceof Error ? error.message : String(error)}`
       )
+    }
+  }
+  if (normalized.autoWireAgency) {
+    // Zero hand edits: a fresh install only has to be installed, not wired.
+    try {
+      wireAgencyProfiles(normalized.providerName, ctx.logger)
+    } catch (error) {
+      ctx.logger.warn(`${PLUGIN}: agency auto-wire skipped: ${describeError(error)}`)
     }
   }
   // Team mode: continuable children bypass provider.start(), so their route has to

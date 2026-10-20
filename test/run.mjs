@@ -14,10 +14,10 @@
  *   3. settings file `default`           — legacy fallback
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, teamInjectionCapabilities } from '../index.js'
+import { apply, teamInjectionCapabilities, wireAgencyProvider } from '../index.js'
 
 const HOOK = Symbol.for('dsh-subagent-route-pin.continuable-hook')
 
@@ -58,7 +58,8 @@ function makeHarness(config, extraCtx = {}) {
   const ctx = {
     logger: {
       info: (message) => logs.push(['info', message]),
-      warn: (message) => logs.push(['warn', message])
+      warn: (message) => logs.push(['warn', message]),
+      error: (message) => logs.push(['error', message])
     },
     subagents: service,
     llm: {
@@ -160,7 +161,7 @@ writeFileSync(settingsPath, JSON.stringify({ default: { provider: 'our-free-mode
 // --- 6. an unusable expert override falls back to the row, with a warning --
 writeFileSync(settingsPath, JSON.stringify({ experts: { x: { provider: 'nope', model: 'ghost' } } }), 'utf8')
 {
-  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash', onPinFailure: 'inherit' })
   const { forwarded } = await startWith(harness, 'X')
   check('unknown provider falls back to the row', forwarded.agentOptions.provider === 'deepseek-account' && forwarded.agentOptions.model === 'deepseek-flash', JSON.stringify(forwarded.agentOptions))
   check('fallback warned', harness.logs.some(([kind, message]) => kind === 'warn' && message.includes('not registered')), JSON.stringify(harness.logs.at(-1)))
@@ -472,9 +473,9 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   )
 }
 
-// --- 24. a dead pinned route falls back to the inherited route ----------
+// --- 24. onPinFailure: inherit falls back to the inherited route ---------
 {
-  const harness = makeHarness({ provider: 'our-free-model', model: 'deepseek-v4.1-flash-free' })
+  const harness = makeHarness({ provider: 'our-free-model', model: 'deepseek-v4.1-flash-free', onPinFailure: 'inherit' })
   const attempts = []
   harness.service.getProvider = () => ({
     name: 'spawn',
@@ -500,9 +501,9 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   check('fallback: warned', harness.logs.some(([, message]) => message.includes('retrying on the inherited route')))
 }
 
-// --- 25. fallback: false keeps the failure fatal ------------------------
+// --- 25. a dead pin fails loudly by default (no silent model swap) ------
 {
-  const harness = makeHarness({ provider: 'our-free-model', model: 'deepseek-v4.1-flash-free', fallback: false })
+  const harness = makeHarness({ provider: 'our-free-model', model: 'deepseek-v4.1-flash-free' })
   harness.service.getProvider = () => ({
     name: 'spawn',
     capabilities: CAPABILITIES,
@@ -516,7 +517,71 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   } catch (error) {
     threw = error
   }
-  check('fallback off: the error propagates', threw !== undefined && threw.message === '429 quota exhausted')
+  check('fail mode: the summon errors instead of swapping models', threw !== undefined && threw.message.includes('429 quota exhausted'))
+  check('fail mode: the user-facing text names the route', threw !== undefined && threw.message.includes('our-free-model/deepseek-v4.1-flash-free'))
+  check('fail mode: the original error is preserved as the cause', threw?.cause?.message === '429 quota exhausted')
+  check('fail mode: nothing is retried on another route', harness.logs.some(([kind]) => kind === 'error'))
+}
+
+// --- 25b. an unusable configured route is a finding, not a silent degrade
+{
+  const harness = makeHarness({ provider: 'no-such-provider', model: 'whatever' })
+  let threw
+  try {
+    await harness.provider.start({ prompt: 'do', parent: {}, label: 'x' })
+  } catch (error) {
+    threw = error
+  }
+  check('unusable route: start rejects', threw !== undefined, String(threw))
+  check('unusable route: names the provider', threw !== undefined && threw.message.includes('not registered'), threw?.message)
+}
+
+// --- 25c. auto-wire writes the agency row, once --------------------------
+{
+  const root = join(dir, 'profile-autowire')
+  mkdirSync(root, { recursive: true })
+  const patch = join(root, 'cordis.patch.yml')
+  writeFileSync(
+    patch,
+    [
+      '- id: some-plugin',
+      '  name: "some"',
+      '  config:',
+      '    a: 1',
+      '- id: agency-agents',
+      '  name: "@michengai/dsh-agency-agents"',
+      '  config:',
+      '    enabled:',
+      '      - engineering-software-architect',
+      '    customExperts: []',
+      ''
+    ].join('\n'),
+    'utf8'
+  )
+  const first = wireAgencyProvider(root, 'pinned-account')
+  const written = readFileSync(patch, 'utf8')
+  check('auto-wire: reports a change', first.changed === true, JSON.stringify(first))
+  check('auto-wire: inserts the provider under config', written.includes('  config:\n    provider: pinned-account'))
+  check('auto-wire: keeps the rest of the row', written.includes('    customExperts: []'))
+  const second = wireAgencyProvider(root, 'pinned-account')
+  check('auto-wire: idempotent', second.changed === false && second.reason === 'already wired', JSON.stringify(second))
+  check('auto-wire: backs the original up', readFileSync(patch, 'utf8').length > 0)
+}
+{
+  const root = join(dir, 'profile-autowire-replace')
+  mkdirSync(root, { recursive: true })
+  const patch = join(root, 'cordis.patch.yml')
+  writeFileSync(patch, '- id: agency-agents\n  name: "x"\n  config:\n    provider: spawn\n    enabled: []\n', 'utf8')
+  wireAgencyProvider(root, 'pinned-account')
+  const written = readFileSync(patch, 'utf8')
+  check('auto-wire: replaces a foreign provider', written.includes('    provider: pinned-account') && !written.includes('provider: spawn'))
+}
+{
+  const root = join(dir, 'profile-no-agency')
+  mkdirSync(root, { recursive: true })
+  writeFileSync(join(root, 'cordis.patch.yml'), '- id: other\n  name: "x"\n', 'utf8')
+  const result = wireAgencyProvider(root, 'pinned-account')
+  check('auto-wire: leaves a profile without agency alone', result.changed === false && result.reason === 'no agency-agents row')
 }
 
 // --- 26. a member that cannot start on the pin is retried without it ----

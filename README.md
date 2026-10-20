@@ -12,7 +12,10 @@
 - 单发子代理走 `provider.start()`：包装 provider 直接生效
 - 团队模式成员不经过 `provider.start()`：在 `subagents.startContinuable()` 上挂一层钩子，把路由填进 `request.agentOptions`（可用 `teamInjection: false` 关闭）
 - **能力标志**：钩子探测结果会发布成 `{ teamInjection: 'installed' | 'unavailable', enabled, reason }`，调用方能读到「团队注入此刻可不可用」，而不是只靠日志猜
-- **失败回退**（`fallback`，默认开）：钉住的路由起不来就退回调用方原本的路由，委派不会因为免费车道额度耗尽而直接失败
+- **零配置可用**：没配路由、或路由指向一个当前不存在的 provider/model 时，子 agent 继承主 agent 的模型，召唤不会失败
+- **失败必提示**（`onPinFailure`，默认 `fail`）：你在设置页选过模型、它却跑不起来时，召唤直接报错并在错误里写明「哪个路由失败、为什么、去哪里改」，绝不静默换成别的模型；设成 `inherit` 才允许回退
+- **自动接线**（`autoWireAgency`，默认开）：挂载时把 profile 里 `agency-agents` 行的 `provider` 补成 `pinned-account`（改前留 `.bak-autowire-*` 备份，已接线则不动），装完不需要手改 YAML
+- 每次委派的结果写进 `~/.dsh/subagent-route-pin.last-run.json`（`pinned` / `failed` + 原因），排障不用翻日志
 - 设置 → **专家模型** 页面：提供商 / 模型 / 推理强度下拉 + 团队模式注入开关 + 专家团引擎提示，保存写回 profile 补丁，下一次委派生效
 - 逐专家覆盖：`~/.dsh/subagent-route-pin.json` 的 `experts` 字段（可选，优先级高于页面）
 
@@ -20,7 +23,7 @@
 
 ```bash
 # 从 tarball
-dsh plugin --profile desktop add "./dsh-subagent-route-pin-0.6.0.tgz"
+dsh plugin --profile desktop add "./dsh-subagent-route-pin-0.7.0.tgz"
 
 # 从 npm（发布后）
 dsh plugin --profile desktop add "dsh-subagent-route-pin"
@@ -31,7 +34,7 @@ dsh plugin --profile desktop add "D:\\path\\to\\dsh-subagent-route-pin"
 
 `dsh plugin` 要写 profile 目录，通常需要提权（关闭沙箱或以同一用户直接运行终端）。
 
-装完后 profile 的 `cordis.patch.yml` 里新增一行（包内 `cordis.patch.yml` 已自带，无需手写）：
+装完后 profile 的 `cordis.patch.yml` 里新增一行（包内 `cordis.patch.yml` 已自带，无需手写）。`provider` 留空即「不钉路由」，子 agent 继承主 agent 的模型：
 
 ```yaml
 - id: subagent-route-pin
