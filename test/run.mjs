@@ -191,17 +191,23 @@ writeFileSync(settingsPath, JSON.stringify({ experts: { x: { provider: 'deepseek
   check('malformed warned', harness.logs.some(([kind, message]) => kind === 'warn' && message.includes('ignoring')), JSON.stringify(harness.logs.slice(-2)))
 }
 
-// --- 9. no route anywhere is a clear failure -----------------------------
+// --- 9. no route anywhere: inherit instead of failing --------------------
 writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
 {
   const harness = makeHarness({ providerName: 'pinned-account', baseProvider: 'spawn' })
+  const { forwarded } = await startWith(harness, 'X')
+  check('missing route delegates without agentOptions', forwarded !== undefined && forwarded.agentOptions === undefined, JSON.stringify(forwarded?.agentOptions))
+  check('missing route logs inherited', harness.logs.some(([kind, message]) => kind === 'info' && message.includes('inherited')), JSON.stringify(harness.logs.slice(-2)))
+}
+{
+  const harness = makeHarness({ providerName: 'pinned-account', baseProvider: 'spawn', strict: true })
   let message
   try {
     await startWith(harness, 'X')
   } catch (error) {
     message = error.message
   }
-  check('missing route names the settings file', typeof message === 'string' && message.includes('no route for expert') && message.includes(settingsPath), message)
+  check('strict turns a missing route into a hard failure', typeof message === 'string' && message.includes('no route for expert') && message.includes(settingsPath), message)
 }
 
 // --- 10. prepareContinuable is delegated --------------------------------
@@ -217,13 +223,8 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
 writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
 {
   const harness = makeHarness({ provider: 'deepseek-account' })
-  let message
-  try {
-    await startWith(harness, 'X')
-  } catch (error) {
-    message = error.message
-  }
-  check('provider without model is skipped at start', typeof message === 'string' && message.includes('no route for expert'), message)
+  const { forwarded } = await startWith(harness, 'X')
+  check('provider without model inherits instead of throwing', forwarded !== undefined && forwarded.agentOptions === undefined, JSON.stringify(forwarded?.agentOptions))
 }
 
 // --- 12. `ctx.config` is a second live source for the row ----------------
@@ -360,7 +361,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     threw = error
   }
   check('missing route does not break member creation', threw === undefined, threw && threw.message)
-  check('missing route warned', harness.logs.some(([kind, message]) => kind === 'warn' && message.includes('inherited route')))
+  check('missing route warned', harness.logs.some(([kind, message]) => kind === 'warn' && message.includes('inherits the parent model')))
   check('member still created', harness.teamCalls.length === 1)
 }
 

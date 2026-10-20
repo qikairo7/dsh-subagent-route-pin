@@ -47,6 +47,17 @@ dsh plugin --profile desktop add "D:\\path\\to\\dsh-subagent-route-pin"
     fallback: true
 ```
 
+**装完不配也能用**：路由没填、或填的 provider/model 在当前账号里不存在时，插件只打一条警告，子 agent 照旧继承主 agent 的模型——不会让召唤失败。`strict: true` 才会把它变成硬错误。
+
+## 真正要改的只有两处
+
+想把子 agent 分到另一条车道，只需要两处：
+
+1. **这条路由** —— `provider` / `model`，指向你账号里真实存在的组合。不用手改文件：打开 设置 → 专家模型，点选后保存即可（写回同一行）。
+2. **专家团那行的 `provider`** —— 改成 `pinned-account`，否则专家根本不经过本插件。
+
+除此之外没有第三处。团队模式（Agent Teams）不走这条路径，见下文。
+
 ## 让专家团用上它
 
 专家团（`@michengai/dsh-agency-agents`）默认走 `spawn`，需要把它的 provider 指过来：

@@ -429,12 +429,18 @@ class RoutePinProvider {
   /**
    * Resolve + validate the route for one label.
    *
-   * `soft: true` is the team-mode variant: a missing or unusable route must not
-   * break member creation, so it warns and returns undefined (the member then
-   * inherits the parent route, i.e. today's default behaviour).
+   * Returns `undefined` when no usable route exists and `strict` is off: the
+   * child then simply inherits the parent's route, which is exactly what a
+   * freshly installed plugin with no configuration should do. A missing route
+   * must never make a delegation fail — that would turn an optional feature into
+   * an outage on every machine that forgot one line of YAML.
+   *
+   * `soft: true` (team mode) additionally swallows a strict-mode throw, because a
+   * broken route must not take member creation down with it.
    */
   async pickRoute(label, soft = false) {
     const { ctx, config } = this.options
+    const strict = config.strict === true
     try {
       const settings = this.readSettings()
       const configured = this.configuredRoute()
@@ -444,17 +450,20 @@ class RoutePinProvider {
       const problem = await this.checkRoute(route)
       if (problem !== undefined) {
         const message = `${PLUGIN}: ${problem} (route came from ${source})`
-        if (config.strict === true) throw new Error(message)
-        if (configured === undefined) throw new Error(`${message}; the config row has no fallback route`)
+        if (strict) throw new Error(message)
+        if (configured === undefined) {
+          ctx.logger.warn(`${message}; no fallback route, so the child inherits the parent model`)
+          return undefined
+        }
         ctx.logger.warn(`${message}; falling back to the config row ${routeKey(configured)}`)
         route = configured
         source = 'config row (fallback)'
       }
       return { route, source }
     } catch (error) {
-      if (soft !== true) throw error
+      if (strict && soft !== true) throw error
       ctx.logger.warn(
-        `${PLUGIN}: team member keeps the inherited route: ${error instanceof Error ? error.message : String(error)}`
+        `${PLUGIN}: no usable route, the child inherits the parent model: ${error instanceof Error ? error.message : String(error)}`
       )
       return undefined
     }
@@ -463,7 +472,17 @@ class RoutePinProvider {
   async start(request) {
     const { ctx, config } = this.options
     const label = request !== null && typeof request === 'object' ? request.label : undefined
-    const { route, source } = await this.pickRoute(label)
+    const base = this.base()
+    const picked = await this.pickRoute(label)
+    if (picked === undefined) {
+      // Zero-config install (or a route that no longer exists): delegate untouched
+      // so the child inherits the parent route instead of the summon failing.
+      ctx.logger.info(
+        `${PLUGIN}: label=${JSON.stringify(label ?? null)} -> inherited (no pinned route configured)`
+      )
+      return base.start({ ...request })
+    }
+    const { route, source } = picked
     const agentOptions = { ...(request.agentOptions ?? {}), provider: route.provider, model: route.model }
     if (route.reasoningEffort !== undefined) agentOptions.reasoningEffort = route.reasoningEffort
     if (route.maxTokens !== undefined) agentOptions.maxTokens = route.maxTokens
@@ -471,7 +490,6 @@ class RoutePinProvider {
       `${PLUGIN}: label=${JSON.stringify(label ?? null)} -> ${routeKey(route)}` +
         `${route.reasoningEffort === undefined ? '' : ` effort=${route.reasoningEffort}`} (${source})`
     )
-    const base = this.base()
     try {
       return await base.start({ ...request, agentOptions })
     } catch (error) {
