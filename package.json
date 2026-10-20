@@ -30,15 +30,15 @@
     "agent-teams",
     "agency-agents"
   ],
-  "author": "沈思宏 (https://github.com/xywr8884156-tech)",
+  "author": "沈思宏 (https://github.com/tkaiz0406)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xywr8884156-tech/dsh-subagent-route-pin.git"
+    "url": "git+https://github.com/tkaiz0406/dsh-subagent-route-pin.git"
   },
-  "homepage": "https://github.com/xywr8884156-tech/dsh-subagent-route-pin#readme",
+  "homepage": "https://github.com/tkaiz0406/dsh-subagent-route-pin#readme",
   "bugs": {
-    "url": "https://github.com/xywr8884156-tech/dsh-subagent-route-pin/issues"
+    "url": "https://github.com/tkaiz0406/dsh-subagent-route-pin/issues"
   },
   "engines": {
     "node": ">=22"

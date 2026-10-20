@@ -236,7 +236,7 @@ pnpm pack --pack-destination dist
 >
 > 另需同步 `test/client.mjs`、`test/browser-harness.html` 里的 id 断言，以及 README 里的安装示例。
 
-GitHub 仓库名与 npm 包名保持一致（`dsh-subagent-route-pin`），仓库归属 `xywr8884156-tech` 是 GitHub 账号，与 npm scope 无关，`repository`/`homepage`/`bugs` 无需随 npm 改名。
+GitHub 仓库名与 npm 包名保持一致（`dsh-subagent-route-pin`），仓库归属 `tkaiz0406` 是 GitHub 账号，与 npm scope 无关，`repository`/`homepage`/`bugs` 无需随 npm 改名。
 
 ## 回滚
 

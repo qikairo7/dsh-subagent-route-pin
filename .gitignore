@@ -4,3 +4,4 @@ dist/
 .agent-teams/
 *.log
 .DS_Store
+.archify/
