@@ -2,10 +2,11 @@
 # 本文件是"包内默认行"：profile 的 cordis.patch.yml 里若已有同 id 行，以 profile 为准。
 # 专家（agency-agents）通过 provider: pinned-account 命中本插件注册的包装 provider，
 # 由 provider/model 两行固定它们实际调用的 LLM 路由；大脑（主 agent）不受影响。
-# 团队模式（agent-agents 不配 maxDepth 时的 native 引擎）成员不经过 provider.start，
-# 由本插件在 subagents.startContinuable 上补 agentOptions，同样固定到这条路由。
+# 团队模式（Agent Teams）成员不经过 provider.start，
+# 由本插件在 subagents.startActivation 上补 agentOptions，同样固定到这条路由。
 #
-# 界面编辑：设置 → 专家模型（左侧导航）。保存写入 profile 补丁，下次召唤生效。
+# 界面编辑：设置 → 专家模型（左侧导航）。provider 与 model 在插件挂载时被快照，
+# 因此保存后需要一次重挂载才生效（改本文件任一个值，或重启 DSH）。
 - insert:
     - id: subagent-route-pin
       name: 'dsh-subagent-route-pin'
@@ -21,7 +22,7 @@
         strict: false
         # 团队模式（Agent Teams / agency native）成员的模型注入。
         # 单发子代理走 provider 包装；团队成员不经过 provider.start，
-        # 由本插件在 startContinuable 上补 agentOptions。关掉就回落到继承大脑模型。
+        # 由本插件在 startActivation 上补 agentOptions。关掉就回落到继承大脑模型。
         teamInjection: true
         # 钉住的路由起不来（额度耗尽、provider 掉线、鉴权失败）时，
         # 退回调用方原本的路由重试一次，而不是让委派直接失败。

@@ -24,7 +24,7 @@
 
 ```bash
 # 从 tarball
-dsh plugin --profile desktop add "./dsh-subagent-route-pin-0.8.0.tgz"
+dsh plugin --profile desktop add "./dsh-subagent-route-pin-0.8.1.tgz"
 
 # 从 npm（发布后）
 dsh plugin --profile desktop add "dsh-subagent-route-pin"
@@ -136,7 +136,7 @@ npm run ready         # 只看盘上的就绪记录，不跑测试
 {
   "schema": 1,
   "plugin": "subagent-route-pin",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "at": "2026-10-20T12:04:11.208Z",
   "mounted": true,
   "providerName": "pinned-account",

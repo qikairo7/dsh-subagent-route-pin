@@ -788,29 +788,73 @@ class TeamInjectionAdapter {
   makeHook(seam, slot) {
     const service = this.service
     const ctx = this.ctx
+    // Everything that needs this plugin's Cordis context is read here, at mount
+    // time. Reading the same values from inside the hook makes DSH throw
+    // `cannot get property "config" without inject`; the catch further down then
+    // turns every delegation into "inherit the parent model" without writing a
+    // single log line, which looks exactly like a working pin.
+    let pinned
+    let teamInjection = true
+    let overrideMemberRoute = true
+    let fallback = false
+    let configured
+    try {
+      pinned = slot.resolve()
+      const own = this.options.config
+      teamInjection = valueOf(own.teamInjection) !== false
+      overrideMemberRoute = valueOf(own.overrideMemberRoute) !== false
+      fallback = valueOf(own.fallback) === true
+      const providerId = valueOf(own.provider)
+      const modelId = valueOf(own.model)
+      const effort = valueOf(own.reasoningEffort)
+      if (
+        typeof providerId === 'string' &&
+        providerId !== '' &&
+        typeof modelId === 'string' &&
+        modelId !== ''
+      ) {
+        configured = {
+          provider: providerId,
+          model: modelId,
+          ...(effort === undefined ? {} : { reasoningEffort: effort })
+        }
+      }
+    } catch (error) {
+      // The config row is unreadable from here; the settings file is not, so the
+      // pin still works for anyone who put a `default` route there.
+      ctx.logger.warn(`${PLUGIN}: route pin falls back to the settings file: ${describeError(error)}`)
+    }
     return async function routePinHook(spec) {
       const entry = slot.seams[seam]
       const request = spec !== null && typeof spec === 'object' ? spec.request : undefined
       let injected
       let original
       try {
-        const provider = slot.resolve()
-        if (
-          provider !== undefined &&
-          // Read live: `teamInjection` is volatile, so the Settings page can switch
-          // it without remounting this plugin.
-          valueOf(provider.options.config.teamInjection) !== false &&
-          request !== null &&
-          typeof request === 'object'
-        ) {
-          const config = provider.options.config
+        if (pinned !== undefined && teamInjection && request !== null && typeof request === 'object') {
           // Agent Teams fills `agentOptions` from its own `memberLlmProvider` /
           // `memberModel`, so an empty-slot-only rule would never pin a member.
           // `overrideMemberRoute` (default on) lets the pinned route win; a caller
           // that already chose a route keeps it when the flag is off.
           const claimed = request.agentOptions !== undefined
-          const mayOverride = claimed ? valueOf(config.overrideMemberRoute) !== false : true
-          const picked = mayOverride ? await provider.pickRoute(spec.label, true) : undefined
+          const mayOverride = claimed ? overrideMemberRoute : true
+          let picked
+          if (mayOverride) {
+            try {
+              const resolved = pinned.resolve(spec.label, pinned.readSettings(), configured)
+              const problem = await pinned.checkRoute(resolved.route)
+              if (problem === undefined) {
+                picked = resolved
+              } else {
+                // Soft mode: an unusable route must not take the delegation down,
+                // but it must never pass in silence either.
+                ctx.logger.warn(
+                  `${PLUGIN}: ${problem} (route came from ${resolved.source}); child inherits the parent model`
+                )
+              }
+            } catch (error) {
+              ctx.logger.warn(`${PLUGIN}: no pinned route for this delegation: ${describeError(error)}`)
+            }
+          }
           // A nested seam (an older runtime calling one method from the other)
           // already carries the route: re-picking the same route would only add a
           // duplicate log line, so treat "already pinned" as done.
@@ -848,9 +892,7 @@ class TeamInjectionAdapter {
       } catch (error) {
         // A member that cannot start on the pinned route must not lose the whole
         // delegation: drop the injection and retry once on the inherited route.
-        if (injected === undefined) throw error
-        const live = slot.resolve()
-        if (live === undefined || live.options.config.fallback !== true) throw error
+        if (injected === undefined || fallback !== true) throw error
         // Restore what the caller asked for: dropping the whole object would also
         // throw away Agent Teams' own member route.
         if (original === undefined) delete request.agentOptions
