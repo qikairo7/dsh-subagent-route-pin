@@ -716,8 +716,12 @@ function publishUnavailable(service, reason) {
  * route instead of failing the delegation.
  */
 class TeamInjectionAdapter {
-  constructor(ctx) {
+  constructor(ctx, options) {
     this.ctx = ctx
+    // The normalized config row `apply()` validated. The hook reads the route and
+    // the switches from here; `options.config` is a Cordis field and reading it
+    // from inside a seam hook throws `cannot get property "config" without inject`.
+    this.options = options
     this.service = ctx.subagents
     this.installed = false
     this.reason = undefined
@@ -788,48 +792,37 @@ class TeamInjectionAdapter {
   makeHook(seam, slot) {
     const service = this.service
     const ctx = this.ctx
-    // Everything that needs this plugin's Cordis context is read here, at mount
-    // time. Reading the same values from inside the hook makes DSH throw
-    // `cannot get property "config" without inject`; the catch further down then
-    // turns every delegation into "inherit the parent model" without writing a
-    // single log line, which looks exactly like a working pin.
-    let pinned
-    let teamInjection = true
-    let overrideMemberRoute = true
-    let fallback = false
-    let configured
-    try {
-      pinned = slot.resolve()
-      const own = this.options.config
-      teamInjection = valueOf(own.teamInjection) !== false
-      overrideMemberRoute = valueOf(own.overrideMemberRoute) !== false
-      fallback = valueOf(own.fallback) === true
+    // `provider` / `model` / `reasoningEffort` stay live accessors, so the route is
+    // rebuilt per call: a Settings-page edit must reach the next delegation without
+    // a remount.
+    const readRoute = (own) => {
       const providerId = valueOf(own.provider)
       const modelId = valueOf(own.model)
       const effort = valueOf(own.reasoningEffort)
-      if (
-        typeof providerId === 'string' &&
-        providerId !== '' &&
-        typeof modelId === 'string' &&
-        modelId !== ''
-      ) {
-        configured = {
-          provider: providerId,
-          model: modelId,
-          ...(effort === undefined ? {} : { reasoningEffort: effort })
-        }
+      if (typeof providerId !== 'string' || providerId === '' || typeof modelId !== 'string' || modelId === '') {
+        return undefined
       }
-    } catch (error) {
-      // The config row is unreadable from here; the settings file is not, so the
-      // pin still works for anyone who put a `default` route there.
-      ctx.logger.warn(`${PLUGIN}: route pin falls back to the settings file: ${describeError(error)}`)
+      return {
+        provider: providerId,
+        model: modelId,
+        ...(effort === undefined ? {} : { reasoningEffort: effort })
+      }
     }
     return async function routePinHook(spec) {
       const entry = slot.seams[seam]
       const request = spec !== null && typeof spec === 'object' ? spec.request : undefined
       let injected
       let original
+      let fallback = false
       try {
+        // Per call, not per mount: a remount swaps `slot.resolve` and `slot.options`,
+        // and the pin has to follow the newest generation of the plugin.
+        const pinned = slot.resolve()
+        const own = slot.options ?? {}
+        const teamInjection = valueOf(own.teamInjection) !== false
+        const overrideMemberRoute = valueOf(own.overrideMemberRoute) !== false
+        fallback = valueOf(own.fallback) === true
+        const configured = readRoute(own)
         if (pinned !== undefined && teamInjection && request !== null && typeof request === 'object') {
           // Agent Teams fills `agentOptions` from its own `memberLlmProvider` /
           // `memberModel`, so an empty-slot-only rule would never pin a member.
@@ -852,7 +845,7 @@ class TeamInjectionAdapter {
                 )
               }
             } catch (error) {
-              ctx.logger.warn(`${PLUGIN}: no pinned route for this delegation: ${describeError(error)}`)
+              ctx.logger.warn(`${PLUGIN}: ${describeError(error)}; the child inherits the parent model`)
             }
           }
           // A nested seam (an older runtime calling one method from the other)
@@ -926,12 +919,16 @@ class TeamInjectionAdapter {
     const existing = readHookSlot(service)
     if (existing !== undefined && existing.adapter !== undefined) {
       existing.resolve = resolveProvider
+      // The hook reads its config row from the slot, so a remount that only swaps
+      // the resolver must swap the row too; otherwise generation N-1's route would
+      // keep winning after a toggle or a settings edit.
+      existing.options = this.options
       this.installed = true
       this.reason = undefined
       this.seams = Array.isArray(existing.installedSeams) ? existing.installedSeams : probe.seams
       return this
     }
-    const slot = { resolve: resolveProvider, seams: {}, adapter: this }
+    const slot = { resolve: resolveProvider, options: this.options, seams: {}, adapter: this }
     const wrapped = []
     for (const seam of probe.seams) {
       const raw = service[seam]
@@ -1100,7 +1097,7 @@ export function apply(ctx, config = {}) {
   // Team mode: continuable children bypass provider.start(), so their route has to
   // be filled into the request before SubagentManager reads it.
   const resolveProvider = () => provider
-  const adapter = new TeamInjectionAdapter(ctx).install(resolveProvider)
+  const adapter = new TeamInjectionAdapter(ctx, normalized).install(resolveProvider)
   // One canonical readiness line + a machine-readable flag, so a deploy check can
   // assert "team injection is live" without pattern-matching a WARN.
   const capability = adapter.capabilities()

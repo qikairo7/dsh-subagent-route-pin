@@ -24,7 +24,7 @@
 
 ```bash
 # 从 tarball
-dsh plugin --profile desktop add "./dsh-subagent-route-pin-0.8.1.tgz"
+dsh plugin --profile desktop add "./dsh-subagent-route-pin-0.8.2.tgz"
 
 # 从 npm（发布后）
 dsh plugin --profile desktop add "dsh-subagent-route-pin"
@@ -136,7 +136,7 @@ npm run ready         # 只看盘上的就绪记录，不跑测试
 {
   "schema": 1,
   "plugin": "subagent-route-pin",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "at": "2026-10-20T12:04:11.208Z",
   "mounted": true,
   "providerName": "pinned-account",
@@ -177,11 +177,12 @@ node test/logs.mjs --log captured-console.txt
 
 | DSH / `@deepseek-ai/dsh-tool-subagent` | 状态 | 说明 |
 | --- | --- | --- |
-| `0.2.1-rc.2` | ✅ 已验证 | 当前 `peerDependencies` 钉住的版本，107 项断言全绿；本机构建只有 `startActivation`（无 `startContinuable`），插件按 `startActivation` 注入 |
+| `0.2.0-rc.1` ≤ 版本 < `0.4.0` | ✅ 覆盖范围 | 当前 `peerDependencies` 写的范围，`0.2.1-rc.2`、`0.2.1-rc.3` 实测 107 项断言全绿；本机构建只有 `startActivation`（无 `startContinuable`），插件按 `startActivation` 注入 |
+| `0.2.1-rc.3` | ✅ 已验证 | 桌面端 0.2.1-rc.3 上 readiness 记录显示 `seams: ["startActivation"]`、`teamInjection: installed`，配置行路由生效 |
 | `0.2.0-rc.x` | ❓ 未验证 | 接口面看起来一致（旧版走 `startContinuable`），但没跑过；装了会看到 peer 警告 |
-| `>= 0.3.0` | ⚠️ 预期不兼容 | 上游一旦改动 provider 或创建子代理的接缝，第 2–5 行日志会先缺，插件按能力标志降级 |
+| `>= 0.4.0` | ⚠️ 未验证 | 超出 peer 范围，DSH 插件管理器会标「异常」并拒绝启动；上游一旦改动 provider 或创建子代理的接缝，日志会先缺，插件按能力标志降级 |
 
-`peerDependencies` 钉死版本是刻意的：**升级前 npm/pnpm 就会警告**，把「升级完发现坏了」提前成「装的时候就知道要验」。想放宽就改 `package.json` 的 `peerDependencies`，但改完请按上面的测试跑一遍再发版。
+`peerDependencies` 从「钉死单个 `0.2.1-rc.2`」放宽到 `>=0.2.0-rc.1 <0.4.0`：DSH 每次发 rc 都不再让这个插件被判不兼容、也不会因此被插件管理器拦下。范围上限留在 `0.4.0`，是因为 provider 和创建子代理的接缝属于内部契约，跨 minor 需要重新验证——发版前请跑 `npm test`（107 项断言）与 `npm run ready`（真实宿主上的 readiness）。
 
 ### 接口依赖
 
