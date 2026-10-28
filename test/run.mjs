@@ -14,7 +14,7 @@
  *   3. settings file `default`           — legacy fallback
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, teamInjectionCapabilities, wireAgencyProvider } from '../index.js'
@@ -986,6 +986,16 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     engineRange === manifest.peerDependencies?.['@deepseek-ai/dsh'],
     `engines.dsh=${String(engineRange)} vs peer=${String(manifest.peerDependencies?.['@deepseek-ai/dsh'])} — the market's Discover filter reads engines.dsh, install reads peerDependencies; one range, two copies`
   )
+
+  // npm silently DELETES a bin entry whose path starts with "./" ("script name
+  // bin/x.mjs was invalid and removed") and the publish still succeeds — the
+  // installed package just has no command. Caught here instead of after publish.
+  const binEntries = Object.entries(manifest.bin ?? {})
+  check('bin is declared', binEntries.length > 0, `bin=${JSON.stringify(manifest.bin)}`)
+  for (const [name, target] of binEntries) {
+    check(`bin ${name}: no leading ./`, !String(target).startsWith('./'), String(target))
+    check(`bin ${name}: file exists`, existsSync(new URL(`../${target}`, import.meta.url)), String(target))
+  }
 }
 
 rmSync(dir, { recursive: true, force: true })
