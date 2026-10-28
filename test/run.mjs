@@ -974,6 +974,18 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     const leaked = refused.filter((version) => satisfiesRange(version, range))
     check(`peer range: ${name} stays below 0.4.0`, leaked.length === 0, `wrongly admitted ${leaked.join(', ')}`)
   }
+
+  // The market index filters the Discover tab by `engines.dsh`, and the plugin
+  // manager gates installs by `peerDependencies`. Two copies of the same range
+  // drift the moment one is edited, and the drift is invisible: the package
+  // lists fine but installs nowhere. Keep them byte-identical.
+  const engineRange = manifest.engines?.dsh
+  check('engines.dsh is declared', typeof engineRange === 'string' && engineRange.length > 0, String(engineRange))
+  check(
+    'engines.dsh matches the @deepseek-ai/dsh peer range',
+    engineRange === manifest.peerDependencies?.['@deepseek-ai/dsh'],
+    `engines.dsh=${String(engineRange)} vs peer=${String(manifest.peerDependencies?.['@deepseek-ai/dsh'])} — the market's Discover filter reads engines.dsh, install reads peerDependencies; one range, two copies`
+  )
 }
 
 rmSync(dir, { recursive: true, force: true })
