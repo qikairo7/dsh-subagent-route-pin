@@ -17,7 +17,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, teamInjectionCapabilities, wireAgencyProvider } from '../index.js'
+import { apply, inject, teamInjectionCapabilities, wireAgencyProvider } from '../index.js'
 
 const HOOK = Symbol.for('dsh-subagent-route-pin.team-hook')
 // Pre-0.8 path, still published so a caller that learned it keeps working.
@@ -1020,6 +1020,19 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     'bundle patch name is a specifier, not a path',
     typeof declared === 'string' && !/[/\\]|^\./.test(declared),
     `name=${String(declared)} — a path here never resolves as a module`
+  )
+  // A REQUIRED inject service that a build does not provide makes Cordis park the
+  // plugin forever - silently, with no log line. In the UI that is indistinguishable
+  // from "not installed", which is the failure mode this file exists to stop.
+  const requiredServices = Array.isArray(inject)
+    ? inject
+    : Array.isArray(inject?.required)
+      ? inject.required
+      : []
+  check(
+    'only services the plugin cannot run without are required',
+    requiredServices.length === 1 && requiredServices[0] === 'subagents',
+    `inject=${JSON.stringify(inject)} - expect required ['subagents'] and llm optional`
   )
 }
 

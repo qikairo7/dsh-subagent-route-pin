@@ -54,7 +54,11 @@ import { pathToFileURL } from 'node:url'
 
 export const name = 'subagent-route-pin'
 
-export const inject = ['subagents', 'llm']
+// `llm` is only used by the best-effort route check (and that call is wrapped in
+// try/catch), so it must be OPTIONAL. Listing it as required makes Cordis hold the
+// whole plugin — silently, with no log line — on any build where the service is
+// absent, which looks exactly like "installed but every field is empty".
+export const inject = { required: ['subagents'], optional: ['llm'] }
 
 /** Verbatim copy of the `spawn` provider's start-time capabilities. */
 const CAPABILITIES = {
