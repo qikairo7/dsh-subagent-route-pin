@@ -27,6 +27,11 @@ const dir = mkdtempSync(join(tmpdir(), 'route-pin-'))
 const settingsPath = join(dir, 'routes.json')
 // Never write the real readiness record from a test run.
 const readinessPath = join(dir, 'ready.json')
+// The activation probe falls back to `~/.dsh`, and this file imports index.js, so
+// a run that outlives the 8 s parked timer would otherwise scribble on a real
+// installation and leave a fake "parked" verdict behind.
+const probePath = join(dir, 'probe.json')
+process.env.DSH_ROUTE_PIN_PROBE_PATH = probePath
 
 const CAPABILITIES = { agentOptions: true, outputSchema: true, depthLimit: true, toolFilter: true, persona: true }
 
@@ -1218,6 +1223,26 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     'a null agentOptions still gets the pin',
     result.ok === true && seen.request.agentOptions?.provider === 'deepseek-account',
     JSON.stringify(seen?.request?.agentOptions)
+  )
+}
+
+// --- 37. the activation probe records success, not only failure --------
+{
+  // A file left by an earlier park must not survive a successful activation: the
+  // whole point of the probe is "what happened last", and a stale verdict is read
+  // as fact.
+  writeFileSync(probePath, JSON.stringify({ schema: 1, phase: 'parked', applied: false, version: '0.0.0' }), 'utf8')
+  makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  const probe = JSON.parse(readFileSync(probePath, 'utf8'))
+  check(
+    'a successful activate overwrites a stale parked verdict',
+    probe.phase === 'applied' && probe.applied === true,
+    JSON.stringify(probe)
+  )
+  check(
+    'the success record carries the running version',
+    typeof probe.version === 'string' && probe.version !== '0.0.0',
+    JSON.stringify(probe)
   )
 }
 

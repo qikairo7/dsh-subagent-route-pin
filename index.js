@@ -1155,8 +1155,25 @@ const activationProbe = setTimeout(() => {
 activationProbe.unref?.()
 export function apply(ctx, config = {}) {
   applied = true
+  // A late activation is still an activation. Disarm the parked check first, so a
+  // slow host is never recorded as one that never called `apply()`.
+  clearTimeout(activationProbe)
   try {
-    return applyInner(ctx, config)
+    const result = applyInner(ctx, config)
+    // Success has to overwrite whatever the previous run left behind. A stale
+    // `parked`/`failed` file is worse than no file at all, because it is believed.
+    writeProbe({
+      schema: 1,
+      plugin: PLUGIN,
+      version: PLUGIN_VERSION,
+      at: new Date().toISOString(),
+      node: process.version,
+      processId: process.pid,
+      phase: 'applied',
+      applied: true,
+      inject: [...inject]
+    })
+    return result
   } catch (error) {
     // Cordis swings an activation error into the host console and nowhere else. A
     // user then sees the same symptom as "never loaded": empty dropdowns.
