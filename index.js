@@ -63,6 +63,16 @@ export const name = 'subagent-route-pin'
 // call site is wrapped in try/catch, so a build without it must degrade, not park.
 export const inject = ['subagents']
 
+/**
+ * Activation probe. `load.json` proves only that the entry file was imported; it
+ * says nothing about whether the host ever called `apply()`. A plugin parked on a
+ * service the context never provides looks healthy from the outside: no log line,
+ * no error, and every setting it owns renders as an empty dropdown. This timer
+ * turns that silence into a file we can read after a restart.
+ */
+const PROBE_DELAY_MS = 8000
+let applied = false
+
 /** Verbatim copy of the `spawn` provider's start-time capabilities. */
 const CAPABILITIES = {
   agentOptions: true,
@@ -1055,6 +1065,18 @@ export function teamInjectionCapabilities(service) {
  * and held back because an `inject` service was missing (Cordis waits silently).
  * This file separates the two, which is otherwise unknowable from outside.
  */
+function probePath() {
+  return process.env.DSH_ROUTE_PIN_PROBE_PATH || join(homedir(), '.dsh', 'subagent-route-pin.probe.json')
+}
+
+function writeProbe(record) {
+  try {
+    writeFileSync(probePath(), `${JSON.stringify(record, null, 2)}\n`)
+  } catch {
+    // A read-only home must not change plugin behaviour.
+  }
+}
+
 function markLoaded() {
   try {
     const file = process.env.DSH_ROUTE_PIN_LOAD_PATH || join(homedir(), '.dsh', 'subagent-route-pin.load.json')
@@ -1069,7 +1091,47 @@ function markLoaded() {
 
 markLoaded()
 
+const activationProbe = setTimeout(() => {
+  if (applied) return
+  writeProbe({
+    schema: 1,
+    plugin: PLUGIN,
+    version: PLUGIN_VERSION,
+    at: new Date().toISOString(),
+    node: process.version,
+    processId: process.pid,
+    phase: 'parked',
+    applied: false,
+    inject: [...inject],
+    waitedMs: PROBE_DELAY_MS,
+    note: 'the module was imported but apply() was never called: the host is holding the plugin back, most likely on an injected service it never sees'
+  })
+}, PROBE_DELAY_MS)
+activationProbe.unref?.()
 export function apply(ctx, config = {}) {
+  applied = true
+  try {
+    return applyInner(ctx, config)
+  } catch (error) {
+    // Cordis swings an activation error into the host console and nowhere else. A
+    // user then sees the same symptom as "never loaded": empty dropdowns.
+    writeProbe({
+      schema: 1,
+      plugin: PLUGIN,
+      version: PLUGIN_VERSION,
+      at: new Date().toISOString(),
+      node: process.version,
+      processId: process.pid,
+      phase: 'failed',
+      applied: true,
+      inject: [...inject],
+      error: describeError(error)
+    })
+    throw error
+  }
+}
+
+function applyInner(ctx, config = {}) {
   const readinessPath = text(valueOf(config.readinessPath), 'config.readinessPath', DEFAULT_READINESS_PATH)
   if (
     ctx.subagents === undefined ||
