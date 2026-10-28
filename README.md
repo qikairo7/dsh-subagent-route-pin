@@ -35,20 +35,25 @@ dsh plugin --profile desktop add "D:\\path\\to\\dsh-subagent-route-pin"
 
 `dsh plugin` 要写 profile 目录，通常需要提权（关闭沙箱或以同一用户直接运行终端）。
 
-`name` 必须是**完整包名**（带 scope）。写成目录名 `dsh-subagent-route-pin` 时 DSH 的 loader 解析不到这个模块，插件静默不加载：设置页那张卡片还在（客户端代码是从 `node_modules` 扫出来的，独立于宿主加载），但供应商/模型两个下拉是空的、推理强度停在第一项 `low`，也不会有就绪记录。这是「装上了但什么都没生效」最常见的原因。
+`name` 是 DSH loader 的**模块解析键**，必须与 `package.json` 的 `name` 逐字一致，并且真的能在 profile 的 `node_modules` 里解析到。两个约束同时成立才加载：
 
-自检一行即可分辨：
+- profile 的 `cordis.patch.yml` 按 `name` 匹配 `cordis.yml` 的基础条目，**不一致整条被跳过**（该行配置静默失效）；
+- loader 拿这个字符串去 `node_modules` 里解析，**解析不到就静默不加载**——设置页那张卡片还在（客户端代码是单独扫描 `node_modules` 得到的，独立于宿主加载），但供应商/模型两个下拉是空的、推理强度停在第一项 `low`，也没有就绪记录。
+
+「装上了但什么都没生效」基本都出在这。典型冲突：profile 用带 scope 的依赖键装（`node_modules/@owner/dsh-subagent-route-pin`），而包名是裸名 `dsh-subagent-route-pin` → 裸名解析不到。两种解法二选一：把依赖键改成包名本身，或在 `node_modules` 里给裸名建一个指向实际目录的 junction（Windows `New-Item -ItemType Junction`，不需要管理员）。
+
+自检两行即可分辨：
 
 ```bash
-node -e "require('@xywr8884156-tech/dsh-subagent-route-pin/package.json')"   # 能解析 → 名字对
-cat ~/.dsh/subagent-route-pin.ready.json                                      # 有且 at 是本次启动 → 宿主真加载了
+node -e "require('dsh-subagent-route-pin/package.json')"   # 能解析 → 名字对
+cat ~/.dsh/subagent-route-pin.ready.json                  # 有且 at 是本次启动 → 宿主真加载了
 ```
 
 装完后 profile 的 `cordis.patch.yml` 里新增一行（包内 `cordis.patch.yml` 已自带，无需手写）。`provider` 留空即「不钉路由」，子 agent 继承主 agent 的模型：
 
 ```yaml
 - id: subagent-route-pin
-  name: "@xywr8884156-tech/dsh-subagent-route-pin"
+  name: "dsh-subagent-route-pin"
   config:
     providerName: pinned-account
     baseProvider: spawn

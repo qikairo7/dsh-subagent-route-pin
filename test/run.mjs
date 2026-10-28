@@ -1006,19 +1006,20 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   const patchFile = new URL('../cordis.patch.yml', import.meta.url)
   const patchText = readFileSync(patchFile, 'utf8')
   const declared = patchText.match(/^\s*name:\s*['"]?([^'"\n]+)['"]?\s*$/m)?.[1]
-  // The installed specifier is the profile's dependency key, which may be scoped
-  // (`@owner/dsh-subagent-route-pin`) even though package.json's own `name` is the
-  // published bare name. What must hold either way: it points at THIS package and
-  // it is a path, not a bare directory name the loader cannot resolve.
+  // `name` is BOTH the loader's module specifier and the key the profile's patch
+  // matches the base entry by. If it drifts from package.json's name the plugin is
+  // silently not loaded — while the settings card still renders (the client bundle
+  // is discovered by scanning node_modules) with empty provider/model dropdowns.
+  // Nothing else in the repo notices, so pin it here.
   check(
-    'bundle patch points at this package',
-    typeof declared === 'string' && declared.endsWith(manifest.name),
+    'bundle patch names the package exactly as package.json does',
+    declared === manifest.name,
     `cordis.patch.yml name=${String(declared)} vs package.json name=${String(manifest.name)}`
   )
   check(
-    'bundle patch name is a resolvable specifier',
-    typeof declared === 'string' && declared.includes('/'),
-    `name=${String(declared)} — a bare directory name is not a module specifier`
+    'bundle patch name is a specifier, not a path',
+    typeof declared === 'string' && !/[/\\]|^\./.test(declared),
+    `name=${String(declared)} — a path here never resolves as a module`
   )
 }
 
