@@ -54,11 +54,14 @@ import { pathToFileURL } from 'node:url'
 
 export const name = 'subagent-route-pin'
 
-// `llm` is only used by the best-effort route check (and that call is wrapped in
-// try/catch), so it must be OPTIONAL. Listing it as required makes Cordis hold the
-// whole plugin — silently, with no log line — on any build where the service is
-// absent, which looks exactly like "installed but every field is empty".
-export const inject = { required: ['subagents'], optional: ['llm'] }
+// Array form ONLY. Cordis reads `inject` as a service list; the `{ required, optional }`
+// object form is not supported by this runtime and makes it wait forever for services
+// literally named "required"/"optional" — parked plugin, no log line, and a settings page
+// with empty provider/model dropdowns. Every plugin in the ecosystem uses the array form.
+//
+// `llm` is deliberately NOT listed: it is only read by the best-effort route check, whose
+// call site is wrapped in try/catch, so a build without it must degrade, not park.
+export const inject = ['subagents']
 
 /** Verbatim copy of the `spawn` provider's start-time capabilities. */
 const CAPABILITIES = {

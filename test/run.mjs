@@ -1030,6 +1030,11 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
       ? inject.required
       : []
   check(
+    'inject is the array form',
+    Array.isArray(inject),
+    `inject=${JSON.stringify(inject)} - the {required,optional} object parks the plugin forever`
+  )
+  check(
     'only services the plugin cannot run without are required',
     requiredServices.length === 1 && requiredServices[0] === 'subagents',
     `inject=${JSON.stringify(inject)} - expect required ['subagents'] and llm optional`
