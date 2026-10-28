@@ -511,9 +511,12 @@ class RoutePinProvider {
     }
     if (configured !== undefined) return { route: configured, source: 'config row' }
     if (settings !== undefined && settings.default !== undefined) return { route: settings.default, source: 'settings default' }
-    throw new Error(
-      `${PLUGIN}: no route for expert ${JSON.stringify(label ?? null)} — ` +
-        `pick a model in Settings → 专家模型 (the plugin's own page), or put a "default" route in ${this.options.config.settingsPath}`
+    throw Object.assign(
+      new Error(
+        `${PLUGIN}: no route for expert ${JSON.stringify(label ?? null)} — ` +
+          `pick a model in Settings → 专家模型 (the plugin's own page), or put a "default" route in ${this.options.config.settingsPath}`
+      ),
+      { routeMissing: true }
     )
   }
 
@@ -565,6 +568,10 @@ class RoutePinProvider {
       if (now - cached.at < ttl) return cached.problem
     }
     let problem
+    // A catalog that cannot be read is not the same as a route that passed:
+    // caching that as a success would mark an unverified route as verified for
+    // the whole success TTL, which quietly disables `strict` after one hiccup.
+    let verified = true
     try {
       const providers = ctx.llm.listProviders()
       const known = providers.some((provider) => provider.id === route.provider)
@@ -577,10 +584,11 @@ class RoutePinProvider {
         }
       }
     } catch (error) {
+      verified = false
       ctx.logger.warn(`${PLUGIN}: route check skipped for ${key}: ${error instanceof Error ? error.message : String(error)}`)
       problem = undefined
     }
-    state.checked.set(key, { at: now, problem })
+    if (verified) state.checked.set(key, { at: now, problem })
     return problem
   }
 
@@ -628,7 +636,11 @@ class RoutePinProvider {
         if (strict || config.onPinFailure !== 'inherit') {
           throw Object.assign(new Error(message), { routeFailure: true })
         }
-        if (configured === undefined) {
+        // "Fall back to the config row" is only a fallback when the route did not
+        // come from that row. If it did, `route` and `configured` are the same
+        // route: retrying it would sleepwalk into the same failure while the log
+        // claimed a working fallback existed.
+        if (configured === undefined || source === 'config row') {
           ctx.logger.warn(`${message}; no fallback route, so the child inherits the parent model`)
           return undefined
         }
@@ -638,9 +650,16 @@ class RoutePinProvider {
       }
       return { route, source }
     } catch (error) {
+      // Only routing findings may degrade to "the child inherits the parent
+      // model". A TypeError from a bug in this plugin used to take the same
+      // branch, so the real defect showed up as one warn line and a subagent
+      // quietly running somewhere else.
+      const finding =
+        error !== null && typeof error === 'object' && (error.routeFailure === true || error.routeMissing === true)
+      if (!finding) throw error
       // A configured-but-unusable route is a finding, not a missing optional: it
       // must reach the caller (and the user) instead of degrading like a bare install.
-      if (error !== null && typeof error === 'object' && error.routeFailure === true && soft !== true) throw error
+      if (error.routeFailure === true && soft !== true) throw error
       if (strict && soft !== true) throw error
       ctx.logger.warn(
         `${PLUGIN}: no usable route, the child inherits the parent model: ${error instanceof Error ? error.message : String(error)}`
@@ -874,6 +893,7 @@ class TeamInjectionAdapter {
       let injected
       let original
       let fallback = false
+      let mayInherit = false
       try {
         // Per call, not per mount: a remount swaps `slot.resolve` and `slot.options`,
         // and the pin has to follow the newest generation of the plugin.
@@ -881,14 +901,22 @@ class TeamInjectionAdapter {
         const own = slot.options ?? {}
         const teamInjection = valueOf(own.teamInjection) !== false
         const overrideMemberRoute = valueOf(own.overrideMemberRoute) !== false
+        // Two different retries live here, and only one of them is a model swap:
+        //  · the caller named its own route (Agent Teams' memberLlmProvider) —
+        //    dropping our pin and retrying on *that* route honours the caller;
+        //  · the caller named nothing — retrying means "inherit the parent
+        //    model", which the plugin row may forbid (`onPinFailure: fail`, the
+        //    default). Same contract as the single-shot path.
         fallback = valueOf(own.fallback) === true
+        mayInherit = valueOf(own.onPinFailure) === 'inherit'
         const configured = readRoute(own)
         if (pinned !== undefined && teamInjection && request !== null && typeof request === 'object') {
           // Agent Teams fills `agentOptions` from its own `memberLlmProvider` /
           // `memberModel`, so an empty-slot-only rule would never pin a member.
           // `overrideMemberRoute` (default on) lets the pinned route win; a caller
           // that already chose a route keeps it when the flag is off.
-          const claimed = request.agentOptions !== undefined
+          const claimed =
+            request.agentOptions !== undefined && request.agentOptions !== null && typeof request.agentOptions === 'object'
           const mayOverride = claimed ? overrideMemberRoute : true
           let picked
           if (mayOverride) {
@@ -946,6 +974,14 @@ class TeamInjectionAdapter {
         // A member that cannot start on the pinned route must not lose the whole
         // delegation: drop the injection and retry once on the inherited route.
         if (injected === undefined || fallback !== true) throw error
+        // Retrying with no route in hand means the child runs on the parent model.
+        if (original === undefined && mayInherit !== true) {
+          ctx.logger.warn(
+            `${PLUGIN}: team member ${JSON.stringify(spec.label ?? null)} failed to start on ${routeKey(injected.route)} ` +
+              `(${describeError(error)}); onPinFailure is "fail", so it is not retried on the parent model`
+          )
+          throw error
+        }
         // Restore what the caller asked for: dropping the whole object would also
         // throw away Agent Teams' own member route.
         if (original === undefined) delete request.agentOptions

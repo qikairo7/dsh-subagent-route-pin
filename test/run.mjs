@@ -774,11 +774,48 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     }
   }
   writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
-  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash', onPinFailure: 'inherit' })
   const result = await service.startActivation({ label: 'x', request: { prompt: 'do', parent: {} } })
   check('team fallback: retried once without the pin', seen.length === 2 && seen[0]?.model === 'deepseek-flash' && seen[1] === undefined, JSON.stringify(seen))
   check('team fallback: member still starts', result.ok === true)
   check('team fallback: warned', logs.some(([, message]) => message.includes('retrying on the inherited route')))
+}
+
+// --- 26b. the default onPinFailure also governs a team member -----------
+// A member must not be re-routed on another model when the plugin row says
+// `fail` (the default): that is the silent swap the plugin exists to prevent.
+{
+  const seen = []
+  const service = Object.create({
+    async startActivation(spec) {
+      seen.push(spec.request.agentOptions)
+      if (spec.request.agentOptions !== undefined) throw new Error('quota exceeded')
+      return { ok: true }
+    }
+  })
+  service.getProvider = () => undefined
+  service.registerProvider = () => () => {}
+  const logs = []
+  const ctx = {
+    logger: { info: () => {}, warn: (message) => logs.push(['warn', message]) },
+    subagents: service,
+    llm: {
+      listProviders: () => [{ id: 'deepseek-account' }],
+      async listModels() {
+        return [{ id: 'deepseek-flash' }]
+      }
+    }
+  }
+  writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
+  apply(ctx, { settingsPath, readinessPath, provider: 'deepseek-account', model: 'deepseek-flash' })
+  let threw
+  try {
+    await service.startActivation({ label: 'x', request: { prompt: 'do', parent: {} } })
+  } catch (error) {
+    threw = error
+  }
+  check('team member: the default fail propagates the error', threw !== undefined && String(threw?.message ?? '').includes('quota exceeded'), threw === undefined ? 'resolved' : threw.message)
+  check('team member: no silent retry on another model', seen.length === 1, `attempts=${seen.length}`)
 }
 
 // --- 27. the three log lines are a contract -----------------------------
@@ -1108,6 +1145,79 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     'readiness is recorded when ctx.config is refused',
     refused.mounted === true && refused.version === selfVersion,
     `mounted=${refused.mounted} version=${refused.version}`
+  )
+}
+
+// --- 33. a catalog that cannot be read is not a verified route ----------
+{
+  let calls = 0
+  const harness = makeHarness(
+    { provider: 'deepseek-account', model: 'deepseek-flash' },
+    {
+      llm: {
+        listProviders: () => {
+          calls += 1
+          if (calls === 1) throw new Error('catalog unavailable')
+          return [{ id: 'deepseek-account' }]
+        },
+        async listModels() {
+          return []
+        }
+      }
+    }
+  )
+  const first = await harness.provider.checkRoute({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  const second = await harness.provider.checkRoute({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  check(
+    'an unreadable catalog is not cached as a pass',
+    first === undefined && /does not advertise/.test(String(second)),
+    `first=${first} second=${second}`
+  )
+}
+
+// --- 34. a broken config row does not pretend to fall back to itself ----
+{
+  const harness = makeHarness({ provider: 'ghost-provider', model: 'ghost-model', onPinFailure: 'inherit' })
+  const { forwarded } = await startWith(harness, 'Anything')
+  const messages = harness.logs.map(([, message]) => message).join(String.fromCharCode(10))
+  check(
+    'a broken config row claims no fallback it does not have',
+    /no fallback route/.test(messages) && !/falling back to the config row/.test(messages),
+    messages
+  )
+}
+
+// --- 35. a bug inside the plugin must surface, not become "inherit" -----
+{
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  harness.provider.readSettings = () => {
+    throw new TypeError('boom')
+  }
+  let threw
+  try {
+    await harness.provider.start({ prompt: 'do', parent: {}, label: 'Anything' })
+  } catch (error) {
+    threw = error
+  }
+  check(
+    'an internal error is not disguised as an inherited route',
+    threw instanceof TypeError && threw.message === 'boom',
+    threw === undefined ? 'resolved' : threw.message
+  )
+}
+
+// --- 36. a null agentOptions is not a claimed route ---------------------
+{
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
+  const result = await harness.service.startActivation({
+    label: 'x',
+    request: { prompt: 'do', parent: {}, agentOptions: null }
+  })
+  const seen = harness.teamCalls.at(-1)
+  check(
+    'a null agentOptions still gets the pin',
+    result.ok === true && seen.request.agentOptions?.provider === 'deepseek-account',
+    JSON.stringify(seen?.request?.agentOptions)
   )
 }
 
