@@ -6,3 +6,4 @@ dist/
 .DS_Store
 .archify/
 .tmp-gh/
+.npmrc

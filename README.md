@@ -257,10 +257,14 @@ npm run ready                     # 3. 挂载层：就绪记录还是这次启�
 包名是**不带 scope** 的 `dsh-subagent-route-pin`（npm 上确认未被占用），因此不需要拥有任何 npm 组织/scope，登录任意账号即可发布：
 
 ```bash
-npm login
-npm publish                    # 无 scope，默认为 public
+npm login --registry=https://registry.npmjs.org/
+npm publish --registry=https://registry.npmjs.org/   # 无 scope，默认为 public
 pnpm pack --pack-destination dist
 ```
+
+> **两个源必须显式指定**。国内机器通常把全局 `registry` 指向 `registry.npmmirror.com`，那是个只读镜像：`npm login` 会把你带到 CNPM 的注册页并报 `Public registration is not allowed`，而 `npm publish` 打到它上面直接 401。本机 `npm config get registry` 返回的就是 `https://registry.npmmirror.com`，所以上面每条命令都带 `--registry`。想省掉参数就在**项目根目录**建一个只含 `registry=https://registry.npmjs.org/` 的 `.npmrc`（项目级配置优先于全局），并把它加进 `.gitignore`。
+>
+> 发布前先跑 `npm publish --dry-run --registry=https://registry.npmjs.org/`，确认 `Publishing to https://registry.npmjs.org/` 且**没有任何 `npm warn`**——`bin` 路径写成 `./bin/x.mjs` 这类问题只在 warn 里出现，`publish` 照样 exit 0，发出去的包里却没有命令。
 
 > 若以后要改到自己的 scope（例如 `@yourname/dsh-subagent-route-pin`），必须同时改这 **4 处**，少一处就会出现「装上了但不加载」：
 >
