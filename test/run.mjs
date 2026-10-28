@@ -828,6 +828,95 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   check('readiness: absent service warns', logs.some(([, message]) => message.includes('registerProvider is unavailable')))
 }
 
+// --- 30. the peer range must not silently exclude prerelease builds ------
+// node-semver only lets a prerelease satisfy a range when some comparator
+// shares its exact major.minor.patch tuple *and* itself carries a prerelease
+// tag. ">=0.2.0-rc.1 <0.4.0" looks broad, but it drops every 0.2.1-rc.* — the
+// build this plugin actually runs on — so npm resolves nothing and the user
+// gets an ERESOLVE they have to work around by hand. Each minor needs its own
+// "||" branch. This is the regression the compat matrix exists to catch.
+{
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+
+  const parseVersion = (version) => {
+    const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(version)
+    if (match === null) throw new Error(`unparseable version: ${version}`)
+    return {
+      core: [Number(match[1]), Number(match[2]), Number(match[3])],
+      pre: match[4] === undefined ? [] : match[4].split('.')
+    }
+  }
+  const compareCore = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]
+  const compareIdentifier = (a, b) => {
+    const aNumeric = /^\d+$/.test(a)
+    const bNumeric = /^\d+$/.test(b)
+    if (aNumeric && bNumeric) return Number(a) - Number(b)
+    if (aNumeric !== bNumeric) return aNumeric ? -1 : 1
+    return a < b ? -1 : a > b ? 1 : 0
+  }
+  const comparePre = (a, b) => {
+    if (a.length === 0 && b.length === 0) return 0
+    if (a.length === 0) return 1
+    if (b.length === 0) return -1
+    for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+      if (a[i] === undefined) return -1
+      if (b[i] === undefined) return 1
+      const order = compareIdentifier(a[i], b[i])
+      if (order !== 0) return order
+    }
+    return 0
+  }
+  const satisfiesComparator = (version, comparator) => {
+    const match = /^(>=|<=|>|<|=)?\s*(.+)$/.exec(comparator.trim())
+    if (match === null) throw new Error(`unparseable comparator: ${comparator}`)
+    const operator = match[1] ?? '='
+    const bound = parseVersion(match[2])
+    // Full semver ordering: compare the core, then the prerelease, where a
+    // plain version outranks any prerelease of the same tuple.
+    const coreOrder = compareCore(version.core, bound.core)
+    const order = coreOrder !== 0 ? coreOrder : comparePre(version.pre, bound.pre)
+    if (operator === '>=') return order >= 0
+    if (operator === '>') return order > 0
+    if (operator === '<=') return order <= 0
+    if (operator === '<') return order < 0
+    return order === 0
+  }
+  const sameTuple = (a, b) => a.core[0] === b.core[0] && a.core[1] === b.core[1] && a.core[2] === b.core[2]
+  const satisfiesRange = (version, range) => {
+    const parsed = parseVersion(version)
+    return range.split('||').some((branch) => {
+      const comparators = branch.trim().split(/\s+/)
+      if (!comparators.every((comparator) => satisfiesComparator(parsed, comparator))) return false
+      // node-semver's prerelease gate is per comparator *set*: a prerelease
+      // only passes when some comparator in the same set shares its exact
+      // major.minor.patch tuple and itself carries a prerelease tag. This is
+      // why ">=0.2.0-rc.1 <0.4.0" admits 0.2.0-rc.1 but not 0.2.1-rc.2.
+      if (parsed.pre.length === 0) return true
+      return comparators.some((comparator) => {
+        const bound = parseVersion(comparator.replace(/^(>=|<=|>|<|=)\s*/, ''))
+        return sameTuple(parsed, bound) && bound.pre.length > 0
+      })
+    })
+  }
+
+  const supported = ['0.2.0-rc.1', '0.2.0-rc.2', '0.2.1-rc.1', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.1']
+  const refused = ['0.1.9', '0.4.0-rc.1', '0.4.0', '0.5.0']
+
+  for (const name of ['@deepseek-ai/dsh', '@deepseek-ai/dsh-tool-subagent']) {
+    const range = manifest.peerDependencies[name]
+    check(`peer range: ${name} is declared`, typeof range === 'string' && range.length > 0, String(range))
+    if (typeof range !== 'string') continue
+    const missed = supported.filter((version) => !satisfiesRange(version, range))
+    check(
+      `peer range: ${name} admits every supported build`,
+      missed.length === 0,
+      `excluded ${missed.join(', ')} — a bare ">=a-rc.1 <b" drops every later rc; each minor needs its own branch`
+    )
+    const leaked = refused.filter((version) => satisfiesRange(version, range))
+    check(`peer range: ${name} stays below 0.4.0`, leaked.length === 0, `wrongly admitted ${leaked.join(', ')}`)
+  }
+}
+
 rmSync(dir, { recursive: true, force: true })
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)
 process.exit(failures === 0 ? 0 : 1)
