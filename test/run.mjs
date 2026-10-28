@@ -828,6 +828,65 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   check('readiness: absent service warns', logs.some(([, message]) => message.includes('registerProvider is unavailable')))
 }
 
+// --- 31. the readiness record names the route actually in force -----------
+// A settings file whose `default` is overruled by the config row used to fail
+// silently: the JSON said one model, delegations got another, and nothing in the
+// readiness record or the logs said which one won.
+{
+  writeFileSync(
+    settingsPath,
+    JSON.stringify({ default: { provider: 'deepseek-account', model: 'deepseek-pro' } }),
+    'utf8'
+  )
+  const harness = makeHarness({ provider: 'our-free-model', model: 'deepseek-v4.1-flash-free' })
+  const record = JSON.parse(readFileSync(readinessPath, 'utf8'))
+  check(
+    'readiness: effective route is the config row',
+    record.route === 'our-free-model/deepseek-v4.1-flash-free' && record.routeSource === 'config row',
+    JSON.stringify({ route: record.route, routeSource: record.routeSource })
+  )
+  check(
+    'readiness: the shadowed settings default is still reported',
+    record.settingsDefault === 'deepseek-account/deepseek-pro' && record.settingsDefaultShadowed === true,
+    JSON.stringify({ settingsDefault: record.settingsDefault, shadowed: record.settingsDefaultShadowed })
+  )
+  check(
+    'readiness: a shadowed settings default warns instead of staying silent',
+    harness.logs.some(
+      ([level, message]) => level === 'warn' && message.includes('settings default is ignored')
+    ),
+    JSON.stringify(harness.logs.filter(([level]) => level === 'warn'))
+  )
+  const { forwarded } = await startWith(harness, 'Anything')
+  check(
+    'readiness: the reported route is the one a delegation gets',
+    forwarded.agentOptions.provider === 'our-free-model' &&
+      forwarded.agentOptions.model === 'deepseek-v4.1-flash-free',
+    JSON.stringify(forwarded.agentOptions)
+  )
+}
+
+// --- 32. with no config row, the settings default is reported as in force -
+{
+  writeFileSync(
+    settingsPath,
+    JSON.stringify({ default: { provider: 'deepseek-account', model: 'deepseek-pro' } }),
+    'utf8'
+  )
+  makeHarness({})
+  const record = JSON.parse(readFileSync(readinessPath, 'utf8'))
+  check(
+    'readiness: settings default wins when the row is empty',
+    record.route === 'deepseek-account/deepseek-pro' && record.routeSource === 'settings default',
+    JSON.stringify({ route: record.route, routeSource: record.routeSource })
+  )
+  check(
+    'readiness: an unshadowed settings default does not warn',
+    record.settingsDefaultShadowed === false,
+    String(record.settingsDefaultShadowed)
+  )
+}
+
 // --- 30. the peer range must not silently exclude prerelease builds ------
 // node-semver only lets a prerelease satisfy a range when some comparator
 // shares its exact major.minor.patch tuple *and* itself carries a prerelease

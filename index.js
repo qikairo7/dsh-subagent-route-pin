@@ -492,6 +492,40 @@ class RoutePinProvider {
   }
 
   /**
+   * The route a delegation would get right now, and where it came from.
+   *
+   * The readiness record used to answer "did it mount" only, which hid a real
+   * failure mode: `~/.dsh/subagent-route-pin.json` could name one model while the
+   * config row named another, and the row silently won. Reporting both — and which
+   * one is effective — makes that visible without running a delegation.
+   */
+  effectiveRoute() {
+    const settings = this.readSettings()
+    const configured = this.configuredRoute()
+    const settingsDefault = settings === undefined ? undefined : settings.default
+    const experts = settings === undefined ? 0 : settings.experts.size
+    if (configured !== undefined) {
+      return {
+        route: routeKey(configured),
+        source: 'config row',
+        configRow: routeKey(configured),
+        settingsDefault: settingsDefault === undefined ? undefined : routeKey(settingsDefault),
+        experts,
+        shadowed: settingsDefault !== undefined
+      }
+    }
+    if (settingsDefault !== undefined) {
+      return {
+        route: routeKey(settingsDefault),
+        source: 'settings default',
+        settingsDefault: routeKey(settingsDefault),
+        experts
+      }
+    }
+    return { route: undefined, source: 'none', experts }
+  }
+
+  /**
    * Best-effort catalog check. DSH treats catalog membership as advisory, so a
    * miss returns a problem string instead of throwing; `strict` turns it fatal.
    */
@@ -1102,6 +1136,16 @@ export function apply(ctx, config = {}) {
   // assert "team injection is live" without pattern-matching a WARN.
   const capability = adapter.capabilities()
   ctx.logger.info(`${PLUGIN}: capabilities ${JSON.stringify(capability)}`)
+  // Which route is actually in force, and whether the settings file is being
+  // ignored because the config row wins. Without this, "I changed the JSON and
+  // nothing happened" has no visible cause anywhere in the logs.
+  const effective = provider.effectiveRoute()
+  if (effective.shadowed === true) {
+    ctx.logger.warn(
+      `${PLUGIN}: ${normalized.settingsPath} sets default ${effective.settingsDefault}, ` +
+        `but the config row pins ${effective.configRow} and wins; the settings default is ignored`
+    )
+  }
   const readinessError = recordReadiness(normalized.readinessPath, {
     schema: 1,
     plugin: PLUGIN,
@@ -1113,6 +1157,12 @@ export function apply(ctx, config = {}) {
     providerName: normalized.providerName,
     baseProvider: normalized.baseProvider,
     settingsPath: normalized.settingsPath,
+    route: effective.route,
+    routeSource: effective.source,
+    configRow: effective.configRow,
+    settingsDefault: effective.settingsDefault,
+    experts: effective.experts,
+    settingsDefaultShadowed: effective.shadowed === true,
     fallback: normalized.fallback,
     teamInjection: normalized.teamInjection !== false,
     overrideMemberRoute: normalized.overrideMemberRoute !== false,

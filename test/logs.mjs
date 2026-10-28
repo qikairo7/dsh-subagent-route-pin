@@ -117,6 +117,22 @@ if (record.overrideMemberRoute === undefined) {
 }
 report('ok', `fallback/route: ${record.providerName} -> ${record.baseProvider}`)
 
+// Which route is in force, and whether the settings file is being ignored.
+// "I edited the JSON and the model did not change" is otherwise unanswerable
+// from the outside: the row wins over the settings default and says nothing.
+if (record.route === undefined) {
+  report('WARN', 'effective route', 'the record predates this field; restart DSH')
+} else {
+  report('ok', `effective route: ${record.route} (from the ${record.routeSource})`)
+  if (record.settingsDefaultShadowed === true) {
+    report(
+      'WARN',
+      'settings default ignored',
+      `${record.settingsDefault} in the settings file loses to the config row ${record.configRow}`
+    )
+  }
+}
+
 if (record.at !== undefined) {
   const ageHours = (Date.now() - Date.parse(record.at)) / 3_600_000
   if (!Number.isFinite(ageHours)) report('WARN', 'record timestamp unreadable', String(record.at))
