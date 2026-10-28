@@ -1041,6 +1041,76 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   )
 }
 
+// --- 31. a refused `ctx.config` must not kill activation -------------------
+// Cordis gates `ctx.config` behind inject: on a context that did not declare it,
+// reading the property throws `cannot get property "config" without inject`.
+// The plugin treats it as an optional second route source, so a refused read has
+// to behave exactly like an absent one - otherwise apply() dies, no config form
+// is registered, and the Settings page renders every field blank.
+{
+  const refusal = new Error('cannot get property "config" without inject')
+  const base = {
+    name: 'spawn',
+    capabilities: CAPABILITIES,
+    inheritsParentContext: false,
+    start(request) {
+      return { started: true, request }
+    },
+    prepareContinuable() {
+      return Promise.resolve({})
+    }
+  }
+  const service = Object.create({
+    async startActivation(spec) {
+      return { ok: true, spec }
+    }
+  })
+  service.getProvider = (name) => (name === 'spawn' ? base : undefined)
+  const registered = []
+  service.registerProvider = (provider) => registered.push(provider)
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    subagents: service,
+    llm: {
+      listProviders: () => [{ id: 'deepseek-account' }],
+      async listModels() {
+        return [{ id: 'deepseek-flash' }]
+      }
+    }
+  }
+  Object.defineProperty(ctx, 'config', {
+    enumerable: true,
+    get() {
+      throw refusal
+    }
+  })
+  const refusedReady = join(dir, 'ready-refused.json')
+  let threw
+  try {
+    apply(ctx, {
+      settingsPath,
+      readinessPath: refusedReady,
+      provider: 'deepseek-account',
+      model: 'deepseek-flash'
+    })
+  } catch (error) {
+    threw = error
+  }
+  check(
+    'a refused ctx.config does not break activation',
+    threw === undefined,
+    threw === undefined ? undefined : threw.message
+  )
+  check('the provider is still registered when ctx.config is refused', registered.length === 1, `registered=${registered.length}`)
+  const refused = JSON.parse(readFileSync(refusedReady, 'utf8'))
+  const selfVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+  check(
+    'readiness is recorded when ctx.config is refused',
+    refused.mounted === true && refused.version === selfVersion,
+    `mounted=${refused.mounted} version=${refused.version}`
+  )
+}
+
 rmSync(dir, { recursive: true, force: true })
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)
 process.exit(failures === 0 ? 0 : 1)

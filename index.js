@@ -426,7 +426,16 @@ class RoutePinProvider {
   configuredRoute() {
     const { ctx, config } = this.options
     const sources = [config]
-    const live = ctx.config
+    // `ctx.config` is itself inject-gated: reading it on a context that did not
+    // declare it raises `cannot get property "config" without inject` and kills
+    // activation. It is only an optional second source, so a refused read must
+    // behave exactly like an absent one.
+    let live
+    try {
+      live = ctx.config
+    } catch {
+      live = undefined
+    }
     if (live !== undefined && live !== null && live !== config) sources.push(live)
     for (const source of sources) {
       const provider = valueOf(source.provider)
