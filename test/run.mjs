@@ -996,6 +996,30 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     check(`bin ${name}: no leading ./`, !String(target).startsWith('./'), String(target))
     check(`bin ${name}: file exists`, existsSync(new URL(`../${target}`, import.meta.url)), String(target))
   }
+
+  // The bundle patch writes a loader entry whose `name` is the MODULE SPECIFIER,
+  // not the package directory. A bare "dsh-subagent-route-pin" cannot be resolved
+  // by the loader, so the host plugin never mounts — while the settings card still
+  // renders (the client bundle is discovered by scanning node_modules) and shows
+  // empty provider/model dropdowns. That failure is invisible everywhere except
+  // here, so pin the bundled patch to the published package name.
+  const patchFile = new URL('../cordis.patch.yml', import.meta.url)
+  const patchText = readFileSync(patchFile, 'utf8')
+  const declared = patchText.match(/^\s*name:\s*['"]?([^'"\n]+)['"]?\s*$/m)?.[1]
+  // The installed specifier is the profile's dependency key, which may be scoped
+  // (`@owner/dsh-subagent-route-pin`) even though package.json's own `name` is the
+  // published bare name. What must hold either way: it points at THIS package and
+  // it is a path, not a bare directory name the loader cannot resolve.
+  check(
+    'bundle patch points at this package',
+    typeof declared === 'string' && declared.endsWith(manifest.name),
+    `cordis.patch.yml name=${String(declared)} vs package.json name=${String(manifest.name)}`
+  )
+  check(
+    'bundle patch name is a resolvable specifier',
+    typeof declared === 'string' && declared.includes('/'),
+    `name=${String(declared)} — a bare directory name is not a module specifier`
+  )
 }
 
 rmSync(dir, { recursive: true, force: true })

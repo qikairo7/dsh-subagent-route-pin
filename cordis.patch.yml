@@ -9,7 +9,10 @@
 # 因此保存后需要一次重挂载才生效（改本文件任一个值，或重启 DSH）。
 - insert:
     - id: subagent-route-pin
-      name: 'dsh-subagent-route-pin'
+      # 必须是完整包名（带 scope）：这是 DSH loader 的模块解析键，不是目录名。
+      # 写成 'dsh-subagent-route-pin' 解析不到模块，插件会静默不加载，
+      # 设置页那张卡片仍在（客户端扫描 node_modules 得到），但两个下拉是空的。
+      name: '@xywr8884156-tech/dsh-subagent-route-pin'
       config:
         # 注册的包装 provider 名；agency-agents 的 provider 必须与它一致。
         providerName: pinned-account
