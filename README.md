@@ -46,7 +46,8 @@ dsh plugin --profile desktop add "D:\\path\\to\\dsh-subagent-route-pin"
 
 ```bash
 node -e "require('dsh-subagent-route-pin/package.json')"   # 能解析 → 名字对
-cat ~/.dsh/subagent-route-pin.ready.json                  # 有且 at 是本次启动 → 宿主真加载了
+cat ~/.dsh/subagent-route-pin.load.json                   # 有这个 → 模块被 import 了（apply 不一定跑）
+cat ~/.dsh/subagent-route-pin.ready.json                  # 有且 at 是本次启动 → 宿主真的激活了插件
 ```
 
 装完后 profile 的 `cordis.patch.yml` 里新增一行（包内 `cordis.patch.yml` 已自带，无需手写）。`provider` 留空即「不钉路由」，子 agent 继承主 agent 的模型：

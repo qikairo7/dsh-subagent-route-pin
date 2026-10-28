@@ -1041,6 +1041,27 @@ export function teamInjectionCapabilities(service) {
   return slot.adapter.capabilities()
 }
 
+/**
+ * Breadcrumb written the moment the module is EVALUATED, before Cordis decides
+ * whether to activate it. `ready.json` is written by `apply()`, so its absence is
+ * ambiguous: the module may never have been imported, or it may have been imported
+ * and held back because an `inject` service was missing (Cordis waits silently).
+ * This file separates the two, which is otherwise unknowable from outside.
+ */
+function markLoaded() {
+  try {
+    const file = process.env.DSH_ROUTE_PIN_LOAD_PATH || join(homedir(), '.dsh', 'subagent-route-pin.load.json')
+    writeFileSync(
+      file,
+      `${JSON.stringify({ schema: 1, plugin: PLUGIN, version: PLUGIN_VERSION, at: new Date().toISOString(), node: process.version, processId: process.pid }, null, 2)}\n`
+    )
+  } catch {
+    // A read-only home must not stop the plugin from loading.
+  }
+}
+
+markLoaded()
+
 export function apply(ctx, config = {}) {
   const readinessPath = text(valueOf(config.readinessPath), 'config.readinessPath', DEFAULT_READINESS_PATH)
   if (
