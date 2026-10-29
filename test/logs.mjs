@@ -74,8 +74,12 @@ const probePath = value('--probe', join(homedir(), '.dsh', 'subagent-route-pin.p
 // A record written by an older build says `note` where this one says `reason`,
 // and `error` where this one says `reason`. Reading only the new key turns the
 // one useful sentence into `undefined` — the verdict stays right, the diagnosis
-// does not.
-const probeReason = (probe) => probe.reason ?? probe.note ?? probe.error ?? '(the record predates the reason field)'
+// does not. `??` alone is not enough: 0.8.15 wrote `reason: describeError(error)`,
+// which is '' for an Error without a message, and an empty string stops the chain
+// before the field that actually says something.
+const probeReason = (probe) =>
+  [probe.reason, probe.note, probe.error].find((text) => typeof text === 'string' && text.trim() !== '') ??
+  '(the record predates the reason field)'
 {
   let probe
   try {

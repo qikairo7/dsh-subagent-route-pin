@@ -1387,6 +1387,54 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     String(parkedRun.stdout).slice(0, 300)
   )
 
+  // 0.8.15 wrote `reason: describeError(error)` even when the Error had no
+  // message, so the newest field can be an empty string. Falling through on
+  // `??` alone would stop there and drop the older field that says something.
+  const emptyReason = join(dir, 'empty-reason.json')
+  writeFileSync(
+    emptyReason,
+    JSON.stringify({
+      schema: 1,
+      phase: 'parked',
+      version: '0.8.15',
+      at: new Date().toISOString(),
+      inject: ['subagents'],
+      reason: '',
+      note: 'parked after 8000 ms'
+    }),
+    'utf8'
+  )
+  const emptyRun = spawnSync(process.execPath, [logsScript, '--probe', emptyReason, '--ready', readyForLogs], {
+    encoding: 'utf8'
+  })
+  check(
+    'logs: an empty reason falls through to the older field',
+    String(emptyRun.stdout).includes('parked after 8000 ms') && !String(emptyRun.stdout).includes('predates the reason'),
+    String(emptyRun.stdout).slice(0, 300)
+  )
+
+  // 0.8.14 wrote failures as `error`, with neither `reason` nor `note`.
+  const legacyFailed = join(dir, 'legacy-failed.json')
+  writeFileSync(
+    legacyFailed,
+    JSON.stringify({
+      schema: 1,
+      phase: 'failed',
+      version: '0.8.14',
+      at: new Date().toISOString(),
+      error: 'logger exploded'
+    }),
+    'utf8'
+  )
+  const failedRun = spawnSync(process.execPath, [logsScript, '--probe', legacyFailed, '--ready', readyForLogs], {
+    encoding: 'utf8'
+  })
+  check(
+    'logs: a legacy failed record keeps its error text',
+    failedRun.status === 1 && String(failedRun.stdout).includes('logger exploded'),
+    `${failedRun.status} ${String(failedRun.stdout).slice(0, 300)}`
+  )
+
   const staleApplied = join(dir, 'stale-applied.json')
   writeFileSync(
     staleApplied,
