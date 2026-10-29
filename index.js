@@ -70,7 +70,11 @@ export const inject = ['subagents']
  * no error, and every setting it owns renders as an empty dropdown. This timer
  * turns that silence into a file we can read after a restart.
  */
-const PROBE_DELAY_MS = 8000
+const PROBE_DELAY_MS = (() => {
+  // Overridable so a test can observe the parked branch without waiting 8 seconds.
+  const raw = Number(process.env.DSH_ROUTE_PIN_PROBE_DELAY_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 8000
+})()
 let applied = false
 
 /** Verbatim copy of the `spawn` provider's start-time capabilities. */
@@ -1162,6 +1166,11 @@ export function apply(ctx, config = {}) {
     const result = applyInner(ctx, config)
     // Success has to overwrite whatever the previous run left behind. A stale
     // `parked`/`failed` file is worse than no file at all, because it is believed.
+    // Returning normally is not the same as "mounted": `applyInner` also returns
+    // after refusing a build without `subagents.registerProvider`. Recording that
+    // as `applied` would put this file back in contradiction with `ready.json`
+    // (`mounted: false`) — the exact confusion this probe exists to end.
+    const mounted = !(result !== null && typeof result === 'object' && result.mounted === false)
     writeProbe({
       schema: 1,
       plugin: PLUGIN,
@@ -1169,8 +1178,10 @@ export function apply(ctx, config = {}) {
       at: new Date().toISOString(),
       node: process.version,
       processId: process.pid,
-      phase: 'applied',
+      phase: mounted ? 'applied' : 'degraded',
       applied: true,
+      mounted,
+      ...(mounted ? {} : { reason: describeError(result.reason) }),
       inject: [...inject]
     })
     return result
@@ -1219,7 +1230,9 @@ function applyInner(ctx, config = {}) {
         reason: 'ctx.subagents.registerProvider is unavailable in this DSH build'
       }
     })
-    return
+    // Returning a verdict, not just `undefined`: `apply()` cannot otherwise tell a
+    // mounted plugin from one that declined to mount.
+    return { mounted: false, reason: 'ctx.subagents.registerProvider is unavailable in this DSH build' }
   }
   const settingsPath = text(valueOf(config.settingsPath), 'config.settingsPath', DEFAULT_SETTINGS_PATH)
   const normalized = {
@@ -1333,4 +1346,5 @@ function applyInner(ctx, config = {}) {
       ctx.logger.warn(`${PLUGIN}: cannot scope the team hook disposer: ${describeError(error)}`)
     }
   }
+  return { mounted: true }
 }

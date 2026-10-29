@@ -15,6 +15,7 @@
  */
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, inject, teamInjectionCapabilities, wireAgencyProvider } from '../index.js'
@@ -868,6 +869,12 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     JSON.stringify(record.capabilities)
   )
   check('readiness: absent service warns', logs.some(([, message]) => message.includes('registerProvider is unavailable')))
+  // `applyInner` returns normally here, so the probe must not call this "applied":
+  // a probe that says applied while readiness says mounted:false is the very
+  // contradiction the probe was added to remove.
+  const probe = JSON.parse(readFileSync(probePath, 'utf8'))
+  check('probe: a refused build is degraded, not applied', probe.phase === 'degraded' && probe.mounted === false, JSON.stringify(probe))
+  check('probe: the degraded verdict keeps a reason', String(probe.reason).includes('registerProvider'), JSON.stringify(probe.reason))
 }
 
 // --- 31. the readiness record names the route actually in force -----------
@@ -1239,11 +1246,42 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     probe.phase === 'applied' && probe.applied === true,
     JSON.stringify(probe)
   )
+  // Strict, not "a non-empty string": PLUGIN_VERSION falls back to '' when
+  // package.json cannot be read, and '' used to satisfy the looser assertion.
+  const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
   check(
     'the success record carries the running version',
-    typeof probe.version === 'string' && probe.version !== '0.0.0',
-    JSON.stringify(probe)
+    probe.version === packageVersion,
+    `probe=${JSON.stringify(probe.version)} package=${JSON.stringify(packageVersion)}`
   )
+}
+
+// --- 38. importing without applying is recorded as parked ----------------
+// The parked branch had no test at all: every other case calls `apply()`, which
+// disarms the timer, so nothing guarded the path that actually matters when a
+// plugin is held back by an injected service. A child process is the only honest
+// way to observe it — the parent has already applied.
+{
+  const parkedProbe = join(dir, 'parked.probe.json')
+  const parkedLoad = join(dir, 'parked.load.json')
+  const href = new URL('../index.js', import.meta.url).href
+  const child = spawnSync(
+    process.execPath,
+    ['--input-type=module', '-e', `await import(${JSON.stringify(href)}); await new Promise((r) => setTimeout(r, 300))`],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        DSH_ROUTE_PIN_PROBE_PATH: parkedProbe,
+        DSH_ROUTE_PIN_LOAD_PATH: parkedLoad,
+        DSH_ROUTE_PIN_PROBE_DELAY_MS: '60'
+      }
+    }
+  )
+  check('parked: the child process exits cleanly', child.status === 0, String(child.stderr).slice(0, 300))
+  check('parked: the module really was imported', existsSync(parkedLoad), 'no load breadcrumb')
+  const probe = existsSync(parkedProbe) ? JSON.parse(readFileSync(parkedProbe, 'utf8')) : undefined
+  check('parked: import without apply is recorded', probe?.phase === 'parked' && probe?.applied === false, JSON.stringify(probe))
 }
 
 rmSync(dir, { recursive: true, force: true })
