@@ -885,10 +885,16 @@ class TeamInjectionAdapter {
       if (typeof providerId !== 'string' || providerId === '' || typeof modelId !== 'string' || modelId === '') {
         return undefined
       }
+      // An empty effort is the Settings page's "cleared" value, not a pin to "".
+      // Forwarding it made every continuable child die on its first turn with
+      // UNSUPPORTED_REASONING_EFFORT ("does not support reasoning effort \"\""),
+      // while the single-shot path (normalizeRoute) correctly dropped it — the
+      // same row meant different routes depending on which seam served it.
+      const effortPinned = effort !== undefined && effort !== null && effort !== ''
       return {
         provider: providerId,
         model: modelId,
-        ...(effort === undefined ? {} : { reasoningEffort: effort })
+        ...(effortPinned ? { reasoningEffort: effort } : {})
       }
     }
     return async function routePinHook(spec) {
@@ -952,7 +958,7 @@ class TeamInjectionAdapter {
             const agentOptions = claimed ? { ...request.agentOptions } : {}
             agentOptions.provider = picked.route.provider
             agentOptions.model = picked.route.model
-            if (picked.route.reasoningEffort !== undefined) {
+            if (picked.route.reasoningEffort !== undefined && picked.route.reasoningEffort !== '') {
               agentOptions.reasoningEffort = picked.route.reasoningEffort
             } else if (claimed) {
               // The pinned route says nothing about effort; the claimed value was

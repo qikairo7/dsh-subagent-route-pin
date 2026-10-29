@@ -103,8 +103,11 @@ const probeReason = (probe) =>
     report('MISS', 'activation probe: unreadable', `${probePath}: ${probeError.message}; delete it and restart DSH`)
     missing += 1
   } else if (probe === undefined) {
-    // Not fatal: an install that predates the probe cannot have one.
-    report('WARN', 'activation probe', `no ${probePath}; the plugin was not imported in this boot, or the record predates it`)
+    // The probe is the only file that says whether this boot ran apply(), and the
+    // record left by the previous boot still looks healthy. A warning here meant
+    // "delete the file" passed the gate while "corrupt the file" failed it.
+    report('MISS', 'activation probe', `no ${probePath}; the plugin was not imported in this boot`)
+    missing += 1
   } else if (malformed) {
     // Same policy as an unreadable file: a record that exists but cannot be
     // interpreted is lost evidence, so it fails the gate with or without
@@ -126,22 +129,31 @@ const probeReason = (probe) =>
     report('MISS', 'activation probe: refused to mount', probeReason(probe))
     missing += 1
   } else if (probe.phase === 'applied' && probe.mounted === true) {
-    report('ok', `activation probe: applied (${probe.version})`)
+    // Version first: printing "ok applied" and then warning about the same record
+    // is the green-light-with-a-footnote that made this hard to read, and a record
+    // written by another build is not proof that this build is mounted.
+    if (probe.version !== localVersion) {
+      report('MISS', 'probe version', `probe ${probe.version} vs local ${localVersion}; restart DSH`)
+      missing += 1
+    } else {
+      report('ok', `activation probe: applied (${probe.version})`)
+    }
     // An "ok" with no age reads the same whether this boot wrote it or the one
     // before it did. The readiness check has had an age line for a while; the
     // probe is the file that decides the verdict, so it needs one too.
-    if (probe.version !== localVersion) {
-      report('WARN', 'probe version', `probe ${probe.version} vs local ${localVersion}; restart DSH`)
-    }
     const probeAgeHours = probe.at === undefined ? Number.NaN : (Date.now() - Date.parse(probe.at)) / 3_600_000
-    if (!Number.isFinite(probeAgeHours)) report('WARN', 'probe age', String(probe.at))
+    if (!Number.isFinite(probeAgeHours)) {
+      report('MISS', 'probe age', String(probe.at))
+      missing += 1
+    }
     // A negative age means the clock moved backwards or the record was written
     // with a future timestamp. "ok, written -30 min ago" reads as healthy and is
     // the opposite of what it means. The tolerance is one minute, not one hour:
     // scheduling jitter is seconds, while a half-hour skew is already a wrong
     // answer to "was this written by this boot".
     else if (probeAgeHours < -1 / 60) {
-      report('WARN', 'probe timestamp is in the future', `${probe.at}; check the system clock`)
+      report('MISS', 'probe timestamp is in the future', `${probe.at}; check the system clock`)
+      missing += 1
     } else if (probeAgeHours > 24) {
       report('WARN', `probe is ${Math.round(probeAgeHours / 24)} days old`, 'restart DSH, then re-run')
     } else report('ok', `probe written ${Math.round(probeAgeHours * 60)} min ago`)
@@ -169,6 +181,18 @@ try {
   process.exit(1)
 }
 
+// JSON.parse('null') returns null without throwing, so the catch above does not
+// cover a record that parses into a non-object: reading `record.plugin` then
+// throws a TypeError and the verdict becomes a stack trace. Same rule as the
+// probe side — unusable evidence fails the gate, it does not crash it.
+if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+  report('MISS', 'readiness record: not an object', JSON.stringify(record))
+  process.stdout.write(`
+${readyPath} does not hold a record. Delete it, start DSH again, then re-run.
+`)
+  process.exit(1)
+}
+
 if (record.plugin === 'subagent-route-pin') report('ok', 'plugin identity')
 else {
   report('MISS', 'plugin identity', JSON.stringify(record.plugin))
@@ -177,7 +201,7 @@ else {
 
 if (record.version === localVersion) report('ok', `version ${localVersion}`)
 else {
-  report('WARN', 'version', `record ${record.version} vs local ${localVersion}`)
+  report('MISS', 'version', `record ${record.version} vs local ${localVersion}; restart DSH`)
   missing += 1
 }
 
@@ -243,7 +267,10 @@ if (record.route === undefined) {
 if (record.at !== undefined) {
   const ageHours = (Date.now() - Date.parse(record.at)) / 3_600_000
   if (!Number.isFinite(ageHours)) report('WARN', 'record timestamp unreadable', String(record.at))
-  else if (ageHours < -1 / 60) report('WARN', 'record timestamp is in the future', `${record.at}; check the system clock`)
+  else if (ageHours < -1 / 60) {
+    report('MISS', 'record timestamp is in the future', `${record.at}; check the system clock`)
+    missing += 1
+  }
   else if (ageHours > 24 * 7) report('WARN', `record is ${Math.round(ageHours / 24)} days old`, 'restart DSH, then re-run')
   else report('ok', `recorded ${Math.round(ageHours * 60)} min ago`)
 }

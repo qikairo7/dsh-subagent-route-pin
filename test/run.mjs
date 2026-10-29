@@ -342,6 +342,24 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   check('team member logged', harness.logs.some(([kind, message]) => kind === 'info' && message.includes('team member')))
 }
 
+// --- 16b. an empty effort in the row is "no pin", not a pin to "" ---------
+{
+  // Live failure this locks down (2026-10-29): the Settings page clears the
+  // effort field by writing `reasoningEffort: ""`. readRoute used to forward
+  // that empty string into agentOptions, and every continuable child then died
+  // on its first turn with UNSUPPORTED_REASONING_EFFORT ("does not support
+  // reasoning effort \"\"") — the pin was applied and useless at the same time,
+  // while the single-shot path on the same row worked fine.
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: '' })
+  const spec = { childId: 'c1', provider: 'pinned-account', label: '代码审查工程师', request: { prompt: 'do', parent: {} } }
+  await harness.service.startActivation(spec)
+  const agentOptions = spec.request.agentOptions
+  check('empty effort still pins provider/model', agentOptions?.provider === 'deepseek-account' && agentOptions?.model === 'deepseek-flash', JSON.stringify(agentOptions))
+  check('empty effort is not injected', agentOptions?.reasoningEffort === undefined, JSON.stringify(agentOptions))
+  const { forwarded } = await startWith(harness, 'Anything')
+  check('single-shot drops the empty effort too', forwarded.agentOptions.reasoningEffort === undefined, JSON.stringify(forwarded.agentOptions))
+}
+
 // --- 17. Agent Teams' own member route is overridden by default -----------
 {
   const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
@@ -1491,7 +1509,9 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   })
   check(
     'logs: --strict gives the same verdict on a non-object probe',
-    nullStrictRun.status === nullRun.status,
+    // Equality alone is satisfied by both sides turning green; the point is that
+    // --strict must not launder a broken record into a pass.
+    nullStrictRun.status === 1 && nullRun.status === 1,
     `${nullStrictRun.status} vs ${nullRun.status}`
   )
 
@@ -1592,14 +1612,70 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     timeout: 30_000
   })
   check(
-    'logs: a stale probe still passes the gate',
-    staleRun.status === 0,
+    'logs: a probe from another build fails the gate',
+    staleRun.status === 1,
     `${staleRun.status} ${String(staleRun.stdout).slice(0, 300)}`
   )
   check(
     'logs: the stale probe reports its version and age',
     /probe version/.test(String(staleRun.stdout)) && /probe is 3 days old/.test(String(staleRun.stdout)),
     String(staleRun.stdout).slice(0, 400)
+  )
+
+  // A readiness record that parses into a non-object used to throw a TypeError and
+  // print a stack trace, while a corrupt file produced a clean MISS: same evidence,
+  // two answers. Both must fail, neither may crash.
+  for (const [shape, body] of [['null', 'null'], ['array', '[]'], ['scalar', '"abc"']]) {
+    const broken = join(dir, `ready-${shape}.json`)
+    writeFileSync(broken, body, 'utf8')
+    const run = spawnSync(process.execPath, [logsScript, '--probe', futureProbe, '--ready', broken], {
+      encoding: 'utf8',
+      timeout: 30_000
+    })
+    check(
+      `logs: a ${shape} readiness record fails instead of crashing`,
+      run.status === 1 && !String(run.stderr).includes('TypeError'),
+      `${run.status} ${String(run.stderr).slice(0, 200)}`
+    )
+  }
+
+  // Deleting the probe must not be a way to pass: it is the only file that says
+  // whether this boot ran apply().
+  const missingProbeRun = spawnSync(
+    process.execPath,
+    [logsScript, '--probe', join(dir, 'absent-probe.json'), '--ready', readyForLogs],
+    { encoding: 'utf8', timeout: 30_000 }
+  )
+  check(
+    'logs: a missing probe fails the gate',
+    missingProbeRun.status === 1 && String(missingProbeRun.stdout).includes('was not imported'),
+    `${missingProbeRun.status} ${String(missingProbeRun.stdout).slice(0, 300)}`
+  )
+
+  // A record written by another build cannot prove this build is mounted, and the
+  // severity label has to match the exit code (it used to say WARN and exit 1).
+  const oldReady = join(dir, 'ready-old-version.json')
+  writeFileSync(
+    oldReady,
+    JSON.stringify({
+      plugin: 'subagent-route-pin',
+      version: '0.0.1',
+      mounted: true,
+      capabilities: { teamInjection: 'installed', enabled: true, seams: ['startActivation'] },
+      fallback: true,
+      overrideMemberRoute: true,
+      at: new Date().toISOString()
+    }),
+    'utf8'
+  )
+  const oldRun = spawnSync(process.execPath, [logsScript, '--probe', futureProbe, '--ready', oldReady], {
+    encoding: 'utf8',
+    timeout: 30_000
+  })
+  check(
+    'logs: a record from another build fails and says MISS',
+    oldRun.status === 1 && /MISS\s+version/.test(String(oldRun.stdout)),
+    `${oldRun.status} ${String(oldRun.stdout).slice(0, 300)}`
   )
 }
 
