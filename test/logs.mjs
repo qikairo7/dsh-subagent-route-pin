@@ -266,7 +266,13 @@ if (record.route === undefined) {
 
 if (record.at !== undefined) {
   const ageHours = (Date.now() - Date.parse(record.at)) / 3_600_000
-  if (!Number.isFinite(ageHours)) report('WARN', 'record timestamp unreadable', String(record.at))
+  // Unusable time evidence is a failed gate, not a footnote: the probe side
+  // already treats an unparseable age as MISS, and a corrupted clock must not
+  // read as "everything else is fine, exit 0".
+  if (!Number.isFinite(ageHours)) {
+    report('MISS', 'record timestamp unreadable', `${record.at}; the record is damaged, restart DSH`)
+    missing += 1
+  }
   else if (ageHours < -1 / 60) {
     report('MISS', 'record timestamp is in the future', `${record.at}; check the system clock`)
     missing += 1
