@@ -61,6 +61,8 @@ const report = (state, label, detail) => {
 
 const readyPath = value('--ready', DEFAULT_READY)
 process.stdout.write(`readiness: ${readyPath}\n`)
+// Read before the probe block: the probe's version is compared against it.
+const localVersion = JSON.parse(readFileSync(LOCAL_MANIFEST, 'utf8')).version
 
 // The activation probe is read FIRST, because it is the only evidence that can
 // explain a stale readiness record. `ready.json` is written once per successful
@@ -69,6 +71,11 @@ process.stdout.write(`readiness: ${readyPath}\n`)
 // previous record untouched, and this check used to pass in exactly those two
 // cases. The probe is rewritten on every boot, so it cannot go stale silently.
 const probePath = value('--probe', join(homedir(), '.dsh', 'subagent-route-pin.probe.json'))
+// A record written by an older build says `note` where this one says `reason`,
+// and `error` where this one says `reason`. Reading only the new key turns the
+// one useful sentence into `undefined` — the verdict stays right, the diagnosis
+// does not.
+const probeReason = (probe) => probe.reason ?? probe.note ?? probe.error ?? '(the record predates the reason field)'
 {
   let probe
   try {
@@ -83,17 +90,28 @@ const probePath = value('--probe', join(homedir(), '.dsh', 'subagent-route-pin.p
     report(
       'MISS',
       'activation probe: parked',
-      `${probe.reason} (inject: ${Array.isArray(probe.inject) ? probe.inject.join(', ') : 'unknown'})`
+      `${probeReason(probe)} (inject: ${Array.isArray(probe.inject) ? probe.inject.join(', ') : 'unknown'})`
     )
     missing += 1
   } else if (probe.phase === 'failed') {
-    report('MISS', 'activation probe: apply() threw', probe.reason)
+    report('MISS', 'activation probe: apply() threw', probeReason(probe))
     missing += 1
   } else if (probe.phase === 'degraded') {
-    report('MISS', 'activation probe: refused to mount', probe.reason)
+    report('MISS', 'activation probe: refused to mount', probeReason(probe))
     missing += 1
   } else if (probe.phase === 'applied' && probe.mounted === true) {
     report('ok', `activation probe: applied (${probe.version})`)
+    // An "ok" with no age reads the same whether this boot wrote it or the one
+    // before it did. The readiness check has had an age line for a while; the
+    // probe is the file that decides the verdict, so it needs one too.
+    if (probe.version !== localVersion) {
+      report('WARN', 'probe version', `probe ${probe.version} vs local ${localVersion}; restart DSH`)
+    }
+    const probeAgeHours = probe.at === undefined ? Number.NaN : (Date.now() - Date.parse(probe.at)) / 3_600_000
+    if (!Number.isFinite(probeAgeHours)) report('WARN', 'probe age', String(probe.at))
+    else if (probeAgeHours > 24) {
+      report('WARN', `probe is ${Math.round(probeAgeHours / 24)} days old`, 'restart DSH, then re-run')
+    } else report('ok', `probe written ${Math.round(probeAgeHours * 60)} min ago`)
   } else if (probe.phase === 'applied' && probe.invoked === undefined) {
     // A record written before this schema existed. It cannot answer "did the
     // early return keep its verdict", so it is not proof either way.
@@ -118,16 +136,15 @@ try {
   process.exit(1)
 }
 
-const manifest = JSON.parse(readFileSync(LOCAL_MANIFEST, 'utf8'))
 if (record.plugin === 'subagent-route-pin') report('ok', 'plugin identity')
 else {
   report('MISS', 'plugin identity', JSON.stringify(record.plugin))
   missing += 1
 }
 
-if (record.version === manifest.version) report('ok', `version ${manifest.version}`)
+if (record.version === localVersion) report('ok', `version ${localVersion}`)
 else {
-  report('WARN', 'version', `record ${record.version} vs local ${manifest.version}`)
+  report('WARN', 'version', `record ${record.version} vs local ${localVersion}`)
   missing += 1
 }
 

@@ -1123,8 +1123,11 @@ function probePath() {
  * and nothing else: `mounted` is present on all four phases, and `reason` is
  * always a string when the plugin is not serving. `invoked` (not `applied`) says
  * only what this file can actually know — that `apply()` was entered.
+ *
+ * `waitedMs` is a named parameter on purpose: a catch-all `...extra` would let a
+ * future call site overwrite `mounted` and silently undo the verdict.
  */
-function probeRecord(phase, { mounted, invoked, reason, ...extra }) {
+function probeRecord(phase, { mounted, invoked, reason, waitedMs }) {
   return {
     schema: 1,
     plugin: PLUGIN,
@@ -1136,16 +1139,32 @@ function probeRecord(phase, { mounted, invoked, reason, ...extra }) {
     mounted,
     invoked,
     ...(reason === undefined ? {} : { reason: describeError(reason) }),
-    inject: [...inject],
-    ...extra
+    ...(waitedMs === undefined ? {} : { waitedMs }),
+    inject: [...inject]
   }
 }
 
+/** Returns the write error (or undefined) so a read-only home stays visible. */
 function writeProbe(record) {
   try {
     writeFileSync(probePath(), `${JSON.stringify(record, null, 2)}\n`)
+    return undefined
+  } catch (error) {
+    // A read-only home must not change plugin behaviour, but it must not be
+    // silent either: "no probe file" is otherwise read as "never imported".
+    return describeError(error)
+  }
+}
+
+function warnProbeFailure(ctx, error) {
+  if (error === undefined) return
+  try {
+    ctx.logger.warn(
+      `${PLUGIN}: cannot write the activation probe ${probePath()} (${error}); ` +
+        'a missing probe file will be misread as "never imported"'
+    )
   } catch {
-    // A read-only home must not change plugin behaviour.
+    // The logger is what broke; the probe already carries the reason.
   }
 }
 
@@ -1189,18 +1208,21 @@ export function apply(ctx, config = {}) {
     // Returning normally is also not the same as "mounted": `applyInner` returns
     // after refusing a build without `subagents.registerProvider`.
     const mounted = result?.mounted === true
-    writeProbe(
-      probeRecord(mounted ? 'applied' : 'degraded', {
-        mounted,
-        invoked: true,
-        reason: mounted ? undefined : (result?.reason ?? 'applyInner returned without a mount verdict')
-      })
+    warnProbeFailure(
+      ctx,
+      writeProbe(
+        probeRecord(mounted ? 'applied' : 'degraded', {
+          mounted,
+          invoked: true,
+          reason: mounted ? undefined : (result?.reason ?? 'applyInner returned without a mount verdict')
+        })
+      )
     )
     return result
   } catch (error) {
     // Cordis swings an activation error into the host console and nowhere else. A
     // user then sees the same symptom as "never loaded": empty dropdowns.
-    writeProbe(probeRecord('failed', { mounted: false, invoked: true, reason: error }))
+    warnProbeFailure(ctx, writeProbe(probeRecord('failed', { mounted: false, invoked: true, reason: error })))
     throw error
   }
 }

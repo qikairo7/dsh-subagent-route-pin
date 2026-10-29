@@ -1334,6 +1334,87 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   )
 }
 
+// --- 40. the smoke check reads old-schema probes without losing the reason --
+// `test/logs.mjs` is the post-upgrade gate. Reading only `reason` turned a 0.8.14
+// record (which wrote `note` / `error`) into `undefined`: the verdict stayed
+// right, the one sentence that explains it vanished. The age of an "ok" verdict
+// had the mirror problem — a probe from the previous boot read exactly like one
+// from this boot.
+{
+  const localPackage = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+  const readyForLogs = join(dir, 'logs-ready.json')
+  writeFileSync(
+    readyForLogs,
+    JSON.stringify({
+      schema: 1,
+      plugin: 'subagent-route-pin',
+      version: localPackage,
+      at: new Date().toISOString(),
+      mounted: true,
+      providerName: 'pinned-account',
+      baseProvider: 'spawn',
+      fallback: true,
+      overrideMemberRoute: true,
+      route: 'deepseek-account/deepseek-flash',
+      routeSource: 'config row',
+      capabilities: { teamInjection: 'installed', enabled: true, seams: ['startActivation'] }
+    }),
+    'utf8'
+  )
+  const logsScript = join(import.meta.dirname, 'logs.mjs')
+
+  const legacyParked = join(dir, 'legacy-parked.json')
+  writeFileSync(
+    legacyParked,
+    JSON.stringify({
+      schema: 1,
+      phase: 'parked',
+      applied: false,
+      version: '0.8.14',
+      at: new Date().toISOString(),
+      inject: ['subagents'],
+      note: 'the module was imported but apply() was never called'
+    }),
+    'utf8'
+  )
+  const parkedRun = spawnSync(process.execPath, [logsScript, '--probe', legacyParked, '--ready', readyForLogs], {
+    encoding: 'utf8'
+  })
+  check('logs: a parked record still fails the check', parkedRun.status === 1, String(parkedRun.status))
+  check(
+    'logs: the legacy note is printed instead of undefined',
+    String(parkedRun.stdout).includes('apply() was never called') && !String(parkedRun.stdout).includes('undefined'),
+    String(parkedRun.stdout).slice(0, 300)
+  )
+
+  const staleApplied = join(dir, 'stale-applied.json')
+  writeFileSync(
+    staleApplied,
+    JSON.stringify({
+      schema: 1,
+      phase: 'applied',
+      mounted: true,
+      invoked: true,
+      version: '0.8.9',
+      at: new Date(Date.now() - 3 * 86_400_000).toISOString()
+    }),
+    'utf8'
+  )
+  const staleRun = spawnSync(process.execPath, [logsScript, '--probe', staleApplied, '--ready', readyForLogs], {
+    encoding: 'utf8'
+  })
+  check(
+    'logs: a stale probe still passes the gate',
+    staleRun.status === 0,
+    `${staleRun.status} ${String(staleRun.stdout).slice(0, 300)}`
+  )
+  check(
+    'logs: the stale probe reports its version and age',
+    /probe version/.test(String(staleRun.stdout)) && /probe is 3 days old/.test(String(staleRun.stdout)),
+    String(staleRun.stdout).slice(0, 400)
+  )
+}
+
 rmSync(dir, { recursive: true, force: true })
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) failed`)
 process.exit(failures === 0 ? 0 : 1)
