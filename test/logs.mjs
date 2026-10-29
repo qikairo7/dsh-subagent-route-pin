@@ -79,24 +79,38 @@ const probePath = value('--probe', join(homedir(), '.dsh', 'subagent-route-pin.p
 // before the field that actually says something.
 const probeReason = (probe) =>
   [probe.reason, probe.note, probe.error].find((text) => typeof text === 'string' && text.trim() !== '') ??
-  '(the record predates the reason field)'
+  '(the record has no usable reason text)'
 {
   let probe
+  let probeError
   try {
     probe = JSON.parse(readFileSync(probePath, 'utf8'))
-  } catch {
+  } catch (error) {
     probe = undefined
+    probeError = error
   }
   // JSON.parse('null') succeeds and returns null, so an undefined check alone
   // lets a malformed record through to probe.phase, which throws a TypeError and
   // turns the verdict into a stack trace. Anything that is not a plain object is
   // "no usable record", not "no mount verdict".
   const malformed = probe !== undefined && (probe === null || typeof probe !== 'object' || Array.isArray(probe))
-  if (probe === undefined) {
+  // "The file is missing" and "the file is there but unreadable" are different
+  // diagnoses that used to print the same sentence about the module not being
+  // imported. A damaged record is lost evidence: it fails the gate even without
+  // --strict, because the gate cannot then claim the mount was verified.
+  const unreadable = probeError !== undefined && probeError.code !== 'ENOENT'
+  if (unreadable) {
+    report('MISS', 'activation probe: unreadable', `${probePath}: ${probeError.message}; delete it and restart DSH`)
+    missing += 1
+  } else if (probe === undefined) {
     // Not fatal: an install that predates the probe cannot have one.
     report('WARN', 'activation probe', `no ${probePath}; the plugin was not imported in this boot, or the record predates it`)
   } else if (malformed) {
-    report('WARN', 'activation probe', `the record is not an object: ${JSON.stringify(probe)}; delete ${probePath} and restart DSH`)
+    const detail = `the record is not an object: ${JSON.stringify(probe)}; delete ${probePath} and restart DSH`
+    if (flag('--strict')) {
+      report('MISS', 'activation probe: not an object', detail)
+      missing += 1
+    } else report('WARN', 'activation probe', detail)
   } else if (probe.phase === 'parked') {
     report(
       'MISS',
@@ -120,7 +134,12 @@ const probeReason = (probe) =>
     }
     const probeAgeHours = probe.at === undefined ? Number.NaN : (Date.now() - Date.parse(probe.at)) / 3_600_000
     if (!Number.isFinite(probeAgeHours)) report('WARN', 'probe age', String(probe.at))
-    else if (probeAgeHours > 24) {
+    // A negative age means the clock moved backwards or the record was written
+    // with a future timestamp. "ok, written -91552 min ago" reads as healthy and
+    // is the opposite of what it means.
+    else if (probeAgeHours < -1) {
+      report('WARN', 'probe timestamp is in the future', `${probe.at}; check the system clock`)
+    } else if (probeAgeHours > 24) {
       report('WARN', `probe is ${Math.round(probeAgeHours / 24)} days old`, 'restart DSH, then re-run')
     } else report('ok', `probe written ${Math.round(probeAgeHours * 60)} min ago`)
   } else if (probe.phase === 'applied' && probe.invoked === undefined) {
@@ -192,7 +211,15 @@ if (record.overrideMemberRoute === undefined) {
     record.overrideMemberRoute === true ? undefined : 'Agent Teams members keep their own memberLlmProvider'
   )
 }
-report('ok', `fallback/route: ${record.providerName} -> ${record.baseProvider}`)
+// Neither field is required by the schema, so a hand-trimmed record prints
+// "undefined -> undefined" as an ok line — on the one line that answers "which
+// route is actually in force".
+const routeLine = [record.providerName, record.baseProvider]
+if (routeLine.every((text) => typeof text === 'string' && text !== '')) {
+  report('ok', `fallback/route: ${record.providerName} -> ${record.baseProvider}`)
+} else {
+  report('WARN', 'fallback/route', `the record has no usable route: ${JSON.stringify({ providerName: record.providerName, baseProvider: record.baseProvider })}`)
+}
 
 // Which route is in force, and whether the settings file is being ignored.
 // "I edited the JSON and the model did not change" is otherwise unanswerable
@@ -213,6 +240,7 @@ if (record.route === undefined) {
 if (record.at !== undefined) {
   const ageHours = (Date.now() - Date.parse(record.at)) / 3_600_000
   if (!Number.isFinite(ageHours)) report('WARN', 'record timestamp unreadable', String(record.at))
+  else if (ageHours < -1) report('WARN', 'record timestamp is in the future', `${record.at}; check the system clock`)
   else if (ageHours > 24 * 7) report('WARN', `record is ${Math.round(ageHours / 24)} days old`, 'restart DSH, then re-run')
   else report('ok', `recorded ${Math.round(ageHours * 60)} min ago`)
 }

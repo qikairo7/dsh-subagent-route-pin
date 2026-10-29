@@ -1275,7 +1275,8 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
         DSH_ROUTE_PIN_PROBE_PATH: parkedProbe,
         DSH_ROUTE_PIN_LOAD_PATH: parkedLoad,
         DSH_ROUTE_PIN_PROBE_DELAY_MS: '60'
-      }
+      },
+      timeout: 30_000
     }
   )
   check('parked: the child process exits cleanly', child.status === 0, String(child.stderr).slice(0, 300))
@@ -1378,7 +1379,10 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     'utf8'
   )
   const parkedRun = spawnSync(process.execPath, [logsScript, '--probe', legacyParked, '--ready', readyForLogs], {
-    encoding: 'utf8'
+    encoding: 'utf8',
+    // Without a timeout a hung child hangs the whole suite: the run ends by
+    // never ending, which reads as "CI is stuck", not "a test failed".
+    timeout: 30_000
   })
   check('logs: a parked record still fails the check', parkedRun.status === 1, String(parkedRun.status))
   check(
@@ -1405,7 +1409,10 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     'utf8'
   )
   const emptyRun = spawnSync(process.execPath, [logsScript, '--probe', emptyReason, '--ready', readyForLogs], {
-    encoding: 'utf8'
+    encoding: 'utf8',
+    // Without a timeout a hung child hangs the whole suite: the run ends by
+    // never ending, which reads as "CI is stuck", not "a test failed".
+    timeout: 30_000
   })
   check(
     'logs: an empty reason falls through to the older field',
@@ -1427,7 +1434,10 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     'utf8'
   )
   const failedRun = spawnSync(process.execPath, [logsScript, '--probe', legacyFailed, '--ready', readyForLogs], {
-    encoding: 'utf8'
+    encoding: 'utf8',
+    // Without a timeout a hung child hangs the whole suite: the run ends by
+    // never ending, which reads as "CI is stuck", not "a test failed".
+    timeout: 30_000
   })
   check(
     'logs: a legacy failed record keeps its error text',
@@ -1441,7 +1451,10 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   const nullProbe = join(dir, 'null-probe.json')
   writeFileSync(nullProbe, 'null', 'utf8')
   const nullRun = spawnSync(process.execPath, [logsScript, '--probe', nullProbe, '--ready', readyForLogs], {
-    encoding: 'utf8'
+    encoding: 'utf8',
+    // Without a timeout a hung child hangs the whole suite: the run ends by
+    // never ending, which reads as "CI is stuck", not "a test failed".
+    timeout: 30_000
   })
   check(
     'logs: a non-object probe warns instead of throwing',
@@ -1449,6 +1462,85 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
       String(nullRun.stdout).includes('not an object') &&
       !/TypeError/.test(`${nullRun.stdout}${nullRun.stderr}`),
     `${nullRun.status} ${String(nullRun.stdout).slice(0, 300)} ${String(nullRun.stderr).slice(0, 300)}`
+  )
+
+  // An existing file that cannot be parsed is lost evidence, not "the module was
+  // never imported". The two used to print the same sentence, which sends the
+  // reader to the wrong subsystem entirely.
+  const corruptProbe = join(dir, 'corrupt-probe.json')
+  writeFileSync(corruptProbe, 'not json at all', 'utf8')
+  const corruptRun = spawnSync(process.execPath, [logsScript, '--probe', corruptProbe, '--ready', readyForLogs], {
+    encoding: 'utf8',
+    timeout: 30_000
+  })
+  check(
+    'logs: a corrupt probe fails the gate and names the real cause',
+    corruptRun.status === 1 &&
+      String(corruptRun.stdout).includes('unreadable') &&
+      !String(corruptRun.stdout).includes('was not imported'),
+    `${corruptRun.status} ${String(corruptRun.stdout).slice(0, 300)}`
+  )
+
+  // Under --strict an unusable record must not pass: the gate would otherwise
+  // claim the mount was verified while the only per-boot evidence is garbage.
+  const nullStrictRun = spawnSync(process.execPath, [logsScript, '--strict', '--probe', nullProbe, '--ready', readyForLogs], {
+    encoding: 'utf8',
+    timeout: 30_000
+  })
+  check(
+    'logs: --strict fails on a non-object probe',
+    nullStrictRun.status === 1,
+    `${nullStrictRun.status} ${String(nullStrictRun.stdout).slice(0, 300)}`
+  )
+
+  // A negative age reads as healthy ("ok, written -91552 min ago").
+  const futureProbe = join(dir, 'future-probe.json')
+  writeFileSync(
+    futureProbe,
+    JSON.stringify({
+      schema: 1,
+      phase: 'applied',
+      mounted: true,
+      invoked: true,
+      version: '0.8.19',
+      at: '2099-01-01T00:00:00.000Z'
+    }),
+    'utf8'
+  )
+  const futureRun = spawnSync(process.execPath, [logsScript, '--probe', futureProbe, '--ready', readyForLogs], {
+    encoding: 'utf8',
+    timeout: 30_000
+  })
+  check(
+    'logs: a future timestamp is not reported as a healthy age',
+    String(futureRun.stdout).includes('in the future') && !/ok\s+probe written/.test(String(futureRun.stdout)),
+    String(futureRun.stdout).slice(0, 400)
+  )
+
+  // The route line answers "which route is actually in force"; printing
+  // "undefined -> undefined" as an ok defeats its only purpose.
+  const noRouteReady = join(dir, 'ready-no-route.json')
+  writeFileSync(
+    noRouteReady,
+    JSON.stringify({
+      plugin: 'subagent-route-pin',
+      version: JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version,
+      mounted: true,
+      capabilities: { teamInjection: 'installed', enabled: true, seams: ['startActivation'] },
+      fallback: true,
+      overrideMemberRoute: true,
+      at: new Date().toISOString()
+    }),
+    'utf8'
+  )
+  const noRouteRun = spawnSync(process.execPath, [logsScript, '--probe', futureProbe, '--ready', noRouteReady], {
+    encoding: 'utf8',
+    timeout: 30_000
+  })
+  check(
+    'logs: a record without a route warns instead of printing undefined',
+    String(noRouteRun.stdout).includes('no usable route') && !String(noRouteRun.stdout).includes('ok   fallback/route'),
+    String(noRouteRun.stdout).slice(0, 300)
   )
 
   const staleApplied = join(dir, 'stale-applied.json')
@@ -1465,7 +1557,10 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     'utf8'
   )
   const staleRun = spawnSync(process.execPath, [logsScript, '--probe', staleApplied, '--ready', readyForLogs], {
-    encoding: 'utf8'
+    encoding: 'utf8',
+    // Without a timeout a hung child hangs the whole suite: the run ends by
+    // never ending, which reads as "CI is stuck", not "a test failed".
+    timeout: 30_000
   })
   check(
     'logs: a stale probe still passes the gate',
