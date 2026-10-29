@@ -87,9 +87,16 @@ const probeReason = (probe) =>
   } catch {
     probe = undefined
   }
+  // JSON.parse('null') succeeds and returns null, so an undefined check alone
+  // lets a malformed record through to probe.phase, which throws a TypeError and
+  // turns the verdict into a stack trace. Anything that is not a plain object is
+  // "no usable record", not "no mount verdict".
+  const malformed = probe !== undefined && (probe === null || typeof probe !== 'object' || Array.isArray(probe))
   if (probe === undefined) {
     // Not fatal: an install that predates the probe cannot have one.
     report('WARN', 'activation probe', `no ${probePath}; the plugin was not imported in this boot, or the record predates it`)
+  } else if (malformed) {
+    report('WARN', 'activation probe', `the record is not an object: ${JSON.stringify(probe)}; delete ${probePath} and restart DSH`)
   } else if (probe.phase === 'parked') {
     report(
       'MISS',

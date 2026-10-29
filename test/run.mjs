@@ -1435,6 +1435,22 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     `${failedRun.status} ${String(failedRun.stdout).slice(0, 300)}`
   )
 
+  // A probe file can hold valid JSON that is not an object (`null`, an array, a
+  // bare number). Reading `.phase` off it throws, so the check would die with a
+  // TypeError instead of printing a verdict.
+  const nullProbe = join(dir, 'null-probe.json')
+  writeFileSync(nullProbe, 'null', 'utf8')
+  const nullRun = spawnSync(process.execPath, [logsScript, '--probe', nullProbe, '--ready', readyForLogs], {
+    encoding: 'utf8'
+  })
+  check(
+    'logs: a non-object probe warns instead of throwing',
+    nullRun.status === 0 &&
+      String(nullRun.stdout).includes('not an object') &&
+      !/TypeError/.test(`${nullRun.stdout}${nullRun.stderr}`),
+    `${nullRun.status} ${String(nullRun.stdout).slice(0, 300)} ${String(nullRun.stderr).slice(0, 300)}`
+  )
+
   const staleApplied = join(dir, 'stale-applied.json')
   writeFileSync(
     staleApplied,
