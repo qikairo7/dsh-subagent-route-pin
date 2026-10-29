@@ -315,13 +315,19 @@ function normalizeRoute(value, field, optional = false) {
   if (typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${PLUGIN}: ${field} must be an object with provider and model`)
   }
-  const provider = value.provider
-  const model = value.model
+  // Trim once, here, so every consumer — the optional-absence check below, the
+  // row fields, the settings file — sees the same values. A whitespace-only
+  // field must behave exactly like an absent one: the optional check used to
+  // compare raw strings, so `reasoningEffort: " "` sailed past the `''` guard,
+  // reached text(), and made the whole plugin refuse to mount.
+  const provider = typeof value.provider === 'string' ? value.provider.trim() : value.provider
+  const model = typeof value.model === 'string' ? value.model.trim() : value.model
+  const effort = typeof value.reasoningEffort === 'string' ? value.reasoningEffort.trim() : value.reasoningEffort
   if (
     optional &&
     (provider === undefined || provider === '') &&
     (model === undefined || model === '') &&
-    (value.reasoningEffort === undefined || value.reasoningEffort === '') &&
+    (effort === undefined || effort === '') &&
     (value.maxTokens === undefined || value.maxTokens === null)
   ) {
     return undefined
@@ -330,8 +336,8 @@ function normalizeRoute(value, field, optional = false) {
     provider: text(provider, `${field}.provider`),
     model: text(model, `${field}.model`)
   }
-  if (value.reasoningEffort !== undefined && value.reasoningEffort !== null && value.reasoningEffort !== '') {
-    route.reasoningEffort = text(value.reasoningEffort, `${field}.reasoningEffort`)
+  if (effort !== undefined && effort !== null && effort !== '') {
+    route.reasoningEffort = text(effort, `${field}.reasoningEffort`)
   }
   if (value.maxTokens !== undefined && value.maxTokens !== null) {
     if (!Number.isSafeInteger(value.maxTokens) || value.maxTokens <= 0) {
@@ -879,22 +885,27 @@ class TeamInjectionAdapter {
     // rebuilt per call: a Settings-page edit must reach the next delegation without
     // a remount.
     const readRoute = (own) => {
-      const providerId = valueOf(own.provider)
-      const modelId = valueOf(own.model)
-      const effort = valueOf(own.reasoningEffort)
-      if (typeof providerId !== 'string' || providerId === '' || typeof modelId !== 'string' || modelId === '') {
+      // The single-shot path resolves the row through normalizeRoute: values are
+      // trimmed, an empty effort means "no pin", maxTokens is validated. Reading
+      // the raw accessors here made the seams drift — a blank effort was
+      // forwarded verbatim and killed every continuable child on its first turn
+      // with UNSUPPORTED_REASONING_EFFORT, while a row maxTokens never reached a
+      // team member at all. Reuse the same normalizer so one row cannot mean two
+      // routes; a malformed row resolves to no route (soft mode then falls back)
+      // instead of throwing.
+      try {
+        return normalizeRoute(
+          {
+            provider: valueOf(own.provider),
+            model: valueOf(own.model),
+            reasoningEffort: valueOf(own.reasoningEffort),
+            maxTokens: valueOf(own.maxTokens)
+          },
+          'config',
+          true
+        )
+      } catch {
         return undefined
-      }
-      // An empty effort is the Settings page's "cleared" value, not a pin to "".
-      // Forwarding it made every continuable child die on its first turn with
-      // UNSUPPORTED_REASONING_EFFORT ("does not support reasoning effort \"\""),
-      // while the single-shot path (normalizeRoute) correctly dropped it — the
-      // same row meant different routes depending on which seam served it.
-      const effortPinned = effort !== undefined && effort !== null && effort !== ''
-      return {
-        provider: providerId,
-        model: modelId,
-        ...(effortPinned ? { reasoningEffort: effort } : {})
       }
     }
     return async function routePinHook(spec) {
@@ -958,7 +969,7 @@ class TeamInjectionAdapter {
             const agentOptions = claimed ? { ...request.agentOptions } : {}
             agentOptions.provider = picked.route.provider
             agentOptions.model = picked.route.model
-            if (picked.route.reasoningEffort !== undefined && picked.route.reasoningEffort !== '') {
+            if (picked.route.reasoningEffort !== undefined) {
               agentOptions.reasoningEffort = picked.route.reasoningEffort
             } else if (claimed) {
               // The pinned route says nothing about effort; the claimed value was

@@ -360,6 +360,34 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   check('single-shot drops the empty effort too', forwarded.agentOptions.reasoningEffort === undefined, JSON.stringify(forwarded.agentOptions))
 }
 
+// --- 16c. a blank effort is dropped, a padded one is trimmed — both seams --
+{
+  // `" "` used to slip past the empty-string guard and reach agentOptions: the
+  // same UNSUPPORTED_REASONING_EFFORT death with one more character. The team
+  // path now shares normalizeRoute with the single-shot path, so the two seams
+  // cannot disagree about what the row says.
+  const blank = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: '   ' })
+  const spec = { childId: 'c1', provider: 'pinned-account', label: 'x', request: { prompt: 'do', parent: {} } }
+  await blank.service.startActivation(spec)
+  check('blank effort is not injected', spec.request.agentOptions?.reasoningEffort === undefined, JSON.stringify(spec.request.agentOptions))
+  const padded = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: ' high ' })
+  const single = await startWith(padded, 'Anything')
+  check('single-shot trims a padded effort', single.forwarded.agentOptions.reasoningEffort === 'high', JSON.stringify(single.forwarded.agentOptions))
+  const teamSpec = { childId: 'c2', provider: 'pinned-account', label: 'x', request: { prompt: 'do', parent: {} } }
+  await padded.service.startActivation(teamSpec)
+  check('team path trims a padded effort too', teamSpec.request.agentOptions?.reasoningEffort === 'high', JSON.stringify(teamSpec.request.agentOptions))
+}
+
+// --- 16d. the row's maxTokens reaches team members like single-shot --------
+{
+  const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash', maxTokens: 4096 })
+  const spec = { childId: 'c1', provider: 'pinned-account', label: 'x', request: { prompt: 'do', parent: {} } }
+  await harness.service.startActivation(spec)
+  check('row maxTokens reaches team members', spec.request.agentOptions?.maxTokens === 4096, JSON.stringify(spec.request.agentOptions))
+  const { forwarded } = await startWith(harness, 'Anything')
+  check('row maxTokens reaches single-shot', forwarded.agentOptions.maxTokens === 4096, JSON.stringify(forwarded.agentOptions))
+}
+
 // --- 17. Agent Teams' own member route is overridden by default -----------
 {
   const harness = makeHarness({ provider: 'deepseek-account', model: 'deepseek-flash' })
@@ -1590,6 +1618,50 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     // which must not break when report()'s column width changes.
     String(noRouteRun.stdout).includes('no usable route') && !/ok\s+fallback\/route/.test(String(noRouteRun.stdout)),
     String(noRouteRun.stdout).slice(0, 300)
+  )
+
+  // A record whose `at` no longer parses is damaged time evidence: the probe
+  // side already fails the gate on an unparseable age, so the record side must
+  // not print a WARN and exit 0 on the same input.
+  const goodProbe = join(dir, 'good-probe.json')
+  writeFileSync(
+    goodProbe,
+    JSON.stringify({
+      schema: 1,
+      phase: 'applied',
+      mounted: true,
+      invoked: true,
+      version: localPackage,
+      at: new Date().toISOString()
+    }),
+    'utf8'
+  )
+  const badAtReady = join(dir, 'ready-bad-at.json')
+  writeFileSync(
+    badAtReady,
+    JSON.stringify({
+      plugin: 'subagent-route-pin',
+      version: localPackage,
+      mounted: true,
+      providerName: 'pinned-account',
+      baseProvider: 'spawn',
+      fallback: true,
+      overrideMemberRoute: true,
+      route: 'deepseek-account/deepseek-flash',
+      routeSource: 'config row',
+      capabilities: { teamInjection: 'installed', enabled: true, seams: ['startActivation'] },
+      at: 'abc'
+    }),
+    'utf8'
+  )
+  const badAtRun = spawnSync(process.execPath, [logsScript, '--probe', goodProbe, '--ready', badAtReady], {
+    encoding: 'utf8',
+    timeout: 30_000
+  })
+  check(
+    'logs: an unreadable record timestamp fails the gate',
+    badAtRun.status === 1 && String(badAtRun.stdout).includes('record timestamp unreadable') && !/ok\s+recorded/.test(String(badAtRun.stdout)),
+    `${badAtRun.status} ${String(badAtRun.stdout).slice(0, 300)}`
   )
 
   const staleApplied = join(dir, 'stale-applied.json')
