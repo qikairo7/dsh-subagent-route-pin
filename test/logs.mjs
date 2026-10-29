@@ -106,11 +106,12 @@ const probeReason = (probe) =>
     // Not fatal: an install that predates the probe cannot have one.
     report('WARN', 'activation probe', `no ${probePath}; the plugin was not imported in this boot, or the record predates it`)
   } else if (malformed) {
-    const detail = `the record is not an object: ${JSON.stringify(probe)}; delete ${probePath} and restart DSH`
-    if (flag('--strict')) {
-      report('MISS', 'activation probe: not an object', detail)
-      missing += 1
-    } else report('WARN', 'activation probe', detail)
+    // Same policy as an unreadable file: a record that exists but cannot be
+    // interpreted is lost evidence, so it fails the gate with or without
+    // --strict. Splitting the two by *how* the content is malformed (bad JSON vs
+    // valid JSON of the wrong shape) made one of them pass.
+    report('MISS', 'activation probe: not an object', `${JSON.stringify(probe)}; delete ${probePath} and restart DSH`)
+    missing += 1
   } else if (probe.phase === 'parked') {
     report(
       'MISS',
@@ -135,9 +136,11 @@ const probeReason = (probe) =>
     const probeAgeHours = probe.at === undefined ? Number.NaN : (Date.now() - Date.parse(probe.at)) / 3_600_000
     if (!Number.isFinite(probeAgeHours)) report('WARN', 'probe age', String(probe.at))
     // A negative age means the clock moved backwards or the record was written
-    // with a future timestamp. "ok, written -91552 min ago" reads as healthy and
-    // is the opposite of what it means.
-    else if (probeAgeHours < -1) {
+    // with a future timestamp. "ok, written -30 min ago" reads as healthy and is
+    // the opposite of what it means. The tolerance is one minute, not one hour:
+    // scheduling jitter is seconds, while a half-hour skew is already a wrong
+    // answer to "was this written by this boot".
+    else if (probeAgeHours < -1 / 60) {
       report('WARN', 'probe timestamp is in the future', `${probe.at}; check the system clock`)
     } else if (probeAgeHours > 24) {
       report('WARN', `probe is ${Math.round(probeAgeHours / 24)} days old`, 'restart DSH, then re-run')
@@ -240,7 +243,7 @@ if (record.route === undefined) {
 if (record.at !== undefined) {
   const ageHours = (Date.now() - Date.parse(record.at)) / 3_600_000
   if (!Number.isFinite(ageHours)) report('WARN', 'record timestamp unreadable', String(record.at))
-  else if (ageHours < -1) report('WARN', 'record timestamp is in the future', `${record.at}; check the system clock`)
+  else if (ageHours < -1 / 60) report('WARN', 'record timestamp is in the future', `${record.at}; check the system clock`)
   else if (ageHours > 24 * 7) report('WARN', `record is ${Math.round(ageHours / 24)} days old`, 'restart DSH, then re-run')
   else report('ok', `recorded ${Math.round(ageHours * 60)} min ago`)
 }

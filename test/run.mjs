@@ -1447,7 +1447,9 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
 
   // A probe file can hold valid JSON that is not an object (`null`, an array, a
   // bare number). Reading `.phase` off it throws, so the check would die with a
-  // TypeError instead of printing a verdict.
+  // TypeError instead of printing a verdict. The verdict must also be the same
+  // one a corrupt file gets: unusable evidence cannot pass without --strict and
+  // then fail with it, or the gate's green means nothing.
   const nullProbe = join(dir, 'null-probe.json')
   writeFileSync(nullProbe, 'null', 'utf8')
   const nullRun = spawnSync(process.execPath, [logsScript, '--probe', nullProbe, '--ready', readyForLogs], {
@@ -1457,8 +1459,8 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     timeout: 30_000
   })
   check(
-    'logs: a non-object probe warns instead of throwing',
-    nullRun.status === 0 &&
+    'logs: a non-object probe fails the gate instead of throwing',
+    nullRun.status === 1 &&
       String(nullRun.stdout).includes('not an object') &&
       !/TypeError/.test(`${nullRun.stdout}${nullRun.stderr}`),
     `${nullRun.status} ${String(nullRun.stdout).slice(0, 300)} ${String(nullRun.stderr).slice(0, 300)}`
@@ -1481,19 +1483,23 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
     `${corruptRun.status} ${String(corruptRun.stdout).slice(0, 300)}`
   )
 
-  // Under --strict an unusable record must not pass: the gate would otherwise
-  // claim the mount was verified while the only per-boot evidence is garbage.
+  // The verdict must not depend on the flag: --strict adds requirements, it does
+  // not change how an unusable record is judged.
   const nullStrictRun = spawnSync(process.execPath, [logsScript, '--strict', '--probe', nullProbe, '--ready', readyForLogs], {
     encoding: 'utf8',
     timeout: 30_000
   })
   check(
-    'logs: --strict fails on a non-object probe',
-    nullStrictRun.status === 1,
-    `${nullStrictRun.status} ${String(nullStrictRun.stdout).slice(0, 300)}`
+    'logs: --strict gives the same verdict on a non-object probe',
+    nullStrictRun.status === nullRun.status,
+    `${nullStrictRun.status} vs ${nullRun.status}`
   )
 
-  // A negative age reads as healthy ("ok, written -91552 min ago").
+  // A negative age reads as healthy ("ok, written -30 min ago"). The tolerance is
+  // a minute, so half an hour of skew must be caught; the version comes from the
+  // manifest so this case keeps isolating the timestamp alone after a bump.
+  const manifestVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+  const futureAt = new Date(Date.now() + 30 * 60_000).toISOString()
   const futureProbe = join(dir, 'future-probe.json')
   writeFileSync(
     futureProbe,
@@ -1502,18 +1508,39 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
       phase: 'applied',
       mounted: true,
       invoked: true,
-      version: '0.8.19',
-      at: '2099-01-01T00:00:00.000Z'
+      version: manifestVersion,
+      at: futureAt
     }),
     'utf8'
   )
-  const futureRun = spawnSync(process.execPath, [logsScript, '--probe', futureProbe, '--ready', readyForLogs], {
+  const futureReady = join(dir, 'ready-future.json')
+  writeFileSync(
+    futureReady,
+    JSON.stringify({
+      plugin: 'subagent-route-pin',
+      version: manifestVersion,
+      mounted: true,
+      providerName: 'pinned-account',
+      baseProvider: 'spawn',
+      fallback: true,
+      overrideMemberRoute: true,
+      capabilities: { teamInjection: 'installed', enabled: true, seams: ['startActivation'] },
+      at: futureAt
+    }),
+    'utf8'
+  )
+  const futureRun = spawnSync(process.execPath, [logsScript, '--probe', futureProbe, '--ready', futureReady], {
     encoding: 'utf8',
     timeout: 30_000
   })
   check(
-    'logs: a future timestamp is not reported as a healthy age',
-    String(futureRun.stdout).includes('in the future') && !/ok\s+probe written/.test(String(futureRun.stdout)),
+    'logs: a future probe timestamp is not reported as a healthy age',
+    String(futureRun.stdout).includes('probe timestamp is in the future') && !/ok\s+probe written/.test(String(futureRun.stdout)),
+    String(futureRun.stdout).slice(0, 400)
+  )
+  check(
+    'logs: a future record timestamp is not reported as a healthy age',
+    String(futureRun.stdout).includes('record timestamp is in the future') && !/ok\s+recorded/.test(String(futureRun.stdout)),
     String(futureRun.stdout).slice(0, 400)
   )
 
@@ -1539,7 +1566,9 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   })
   check(
     'logs: a record without a route warns instead of printing undefined',
-    String(noRouteRun.stdout).includes('no usable route') && !String(noRouteRun.stdout).includes('ok   fallback/route'),
+    // Regex, not the padded literal: the assertion is "no ok line for the route",
+    // which must not break when report()'s column width changes.
+    String(noRouteRun.stdout).includes('no usable route') && !/ok\s+fallback\/route/.test(String(noRouteRun.stdout)),
     String(noRouteRun.stdout).slice(0, 300)
   )
 
