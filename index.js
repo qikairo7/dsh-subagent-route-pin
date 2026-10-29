@@ -1118,6 +1118,29 @@ function probePath() {
   return process.env.DSH_ROUTE_PIN_PROBE_PATH || join(homedir(), '.dsh', 'subagent-route-pin.probe.json')
 }
 
+/**
+ * One shape for every verdict. A consumer reads `phase` / `mounted` / `reason`
+ * and nothing else: `mounted` is present on all four phases, and `reason` is
+ * always a string when the plugin is not serving. `invoked` (not `applied`) says
+ * only what this file can actually know — that `apply()` was entered.
+ */
+function probeRecord(phase, { mounted, invoked, reason, ...extra }) {
+  return {
+    schema: 1,
+    plugin: PLUGIN,
+    version: PLUGIN_VERSION,
+    at: new Date().toISOString(),
+    node: process.version,
+    processId: process.pid,
+    phase,
+    mounted,
+    invoked,
+    ...(reason === undefined ? {} : { reason: describeError(reason) }),
+    inject: [...inject],
+    ...extra
+  }
+}
+
 function writeProbe(record) {
   try {
     writeFileSync(probePath(), `${JSON.stringify(record, null, 2)}\n`)
@@ -1142,19 +1165,15 @@ markLoaded()
 
 const activationProbe = setTimeout(() => {
   if (applied) return
-  writeProbe({
-    schema: 1,
-    plugin: PLUGIN,
-    version: PLUGIN_VERSION,
-    at: new Date().toISOString(),
-    node: process.version,
-    processId: process.pid,
-    phase: 'parked',
-    applied: false,
-    inject: [...inject],
-    waitedMs: PROBE_DELAY_MS,
-    note: 'the module was imported but apply() was never called: the host is holding the plugin back, most likely on an injected service it never sees'
-  })
+  writeProbe(
+    probeRecord('parked', {
+      mounted: false,
+      invoked: false,
+      reason:
+        'the module was imported but apply() was never called: the host is holding the plugin back, most likely on an injected service it never sees',
+      waitedMs: PROBE_DELAY_MS
+    })
+  )
 }, PROBE_DELAY_MS)
 activationProbe.unref?.()
 export function apply(ctx, config = {}) {
@@ -1164,42 +1183,24 @@ export function apply(ctx, config = {}) {
   clearTimeout(activationProbe)
   try {
     const result = applyInner(ctx, config)
-    // Success has to overwrite whatever the previous run left behind. A stale
-    // `parked`/`failed` file is worse than no file at all, because it is believed.
-    // Returning normally is not the same as "mounted": `applyInner` also returns
-    // after refusing a build without `subagents.registerProvider`. Recording that
-    // as `applied` would put this file back in contradiction with `ready.json`
-    // (`mounted: false`) — the exact confusion this probe exists to end.
-    const mounted = !(result !== null && typeof result === 'object' && result.mounted === false)
-    writeProbe({
-      schema: 1,
-      plugin: PLUGIN,
-      version: PLUGIN_VERSION,
-      at: new Date().toISOString(),
-      node: process.version,
-      processId: process.pid,
-      phase: mounted ? 'applied' : 'degraded',
-      applied: true,
-      mounted,
-      ...(mounted ? {} : { reason: describeError(result.reason) }),
-      inject: [...inject]
-    })
+    // Fail-closed: only an explicit `{ mounted: true }` counts as mounted. A
+    // future early return that forgets its verdict must never be recorded as a
+    // success — that is exactly how this file ended up contradicting ready.json.
+    // Returning normally is also not the same as "mounted": `applyInner` returns
+    // after refusing a build without `subagents.registerProvider`.
+    const mounted = result?.mounted === true
+    writeProbe(
+      probeRecord(mounted ? 'applied' : 'degraded', {
+        mounted,
+        invoked: true,
+        reason: mounted ? undefined : (result?.reason ?? 'applyInner returned without a mount verdict')
+      })
+    )
     return result
   } catch (error) {
     // Cordis swings an activation error into the host console and nowhere else. A
     // user then sees the same symptom as "never loaded": empty dropdowns.
-    writeProbe({
-      schema: 1,
-      plugin: PLUGIN,
-      version: PLUGIN_VERSION,
-      at: new Date().toISOString(),
-      node: process.version,
-      processId: process.pid,
-      phase: 'failed',
-      applied: true,
-      inject: [...inject],
-      error: describeError(error)
-    })
+    writeProbe(probeRecord('failed', { mounted: false, invoked: true, reason: error }))
     throw error
   }
 }

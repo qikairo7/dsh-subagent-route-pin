@@ -1243,7 +1243,7 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   const probe = JSON.parse(readFileSync(probePath, 'utf8'))
   check(
     'a successful activate overwrites a stale parked verdict',
-    probe.phase === 'applied' && probe.applied === true,
+    probe.phase === 'applied' && probe.invoked === true && probe.mounted === true,
     JSON.stringify(probe)
   )
   // Strict, not "a non-empty string": PLUGIN_VERSION falls back to '' when
@@ -1281,7 +1281,57 @@ writeFileSync(settingsPath, JSON.stringify({}), 'utf8')
   check('parked: the child process exits cleanly', child.status === 0, String(child.stderr).slice(0, 300))
   check('parked: the module really was imported', existsSync(parkedLoad), 'no load breadcrumb')
   const probe = existsSync(parkedProbe) ? JSON.parse(readFileSync(parkedProbe, 'utf8')) : undefined
-  check('parked: import without apply is recorded', probe?.phase === 'parked' && probe?.applied === false, JSON.stringify(probe))
+  check(
+    'parked: import without apply is recorded',
+    probe?.phase === 'parked' && probe?.invoked === false && probe?.mounted === false,
+    JSON.stringify(probe)
+  )
+  // Every phase must answer the same three questions, or the file is only
+  // readable by whoever wrote it: parked used to carry `note` and no `mounted`.
+  check('parked: the verdict carries a reason', typeof probe?.reason === 'string' && probe.reason.includes('never called'), JSON.stringify(probe?.reason))
+}
+
+// --- 39. a throwing activate is recorded as failed ------------------------
+// The catch branch is the third way a plugin disappears (`apply()` throws, Cordis
+// swallows it, the settings page is simply empty). It had no test, and it used to
+// write `applied: true` with an `error` field instead of the common shape.
+{
+  writeFileSync(probePath, JSON.stringify({ schema: 1, phase: 'applied', applied: true, version: '0.0.0' }), 'utf8')
+  const throwCtx = {
+    logger: {
+      info: () => {
+        throw new Error('logger exploded mid-activate')
+      },
+      warn() {},
+      error() {}
+    },
+    subagents: {
+      getProvider: () => undefined,
+      registerProvider: () => () => {}
+    }
+  }
+  let thrown
+  try {
+    apply(throwCtx, { settingsPath, readinessPath })
+  } catch (error) {
+    thrown = error
+  }
+  const probe = JSON.parse(readFileSync(probePath, 'utf8'))
+  check(
+    'a throwing activate is recorded as failed, not applied',
+    thrown instanceof Error && probe.phase === 'failed',
+    JSON.stringify(probe)
+  )
+  check(
+    'the failed verdict keeps the error text in reason',
+    typeof probe.reason === 'string' && probe.reason.includes('logger exploded'),
+    JSON.stringify(probe.reason)
+  )
+  check(
+    'every phase records mounted and invoked',
+    probe.mounted === false && probe.invoked === true,
+    JSON.stringify(probe)
+  )
 }
 
 rmSync(dir, { recursive: true, force: true })

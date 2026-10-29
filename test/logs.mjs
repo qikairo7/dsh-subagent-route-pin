@@ -18,6 +18,11 @@
  *   node test/logs.mjs --strict                 # also fail when team injection is unavailable
  *   node test/logs.mjs --log ~/.dsh/console.txt # also require the three console lines
  *   node test/logs.mjs --ready path/to/ready.json
+ *   node test/logs.mjs --probe path/to/probe.json
+ *
+ * The activation probe is checked first: it is the only file rewritten on every
+ * boot, so it can distinguish "never imported" / "held back on an inject service"
+ * / "apply() threw" from "mounted". A stale readiness record cannot.
  *
  * Exit 1 on a failed check.
  */
@@ -56,6 +61,50 @@ const report = (state, label, detail) => {
 
 const readyPath = value('--ready', DEFAULT_READY)
 process.stdout.write(`readiness: ${readyPath}\n`)
+
+// The activation probe is read FIRST, because it is the only evidence that can
+// explain a stale readiness record. `ready.json` is written once per successful
+// mount, so it stays on disk looking healthy after an upgrade the plugin failed
+// to survive: "held back on an inject service" and "apply() threw" both leave the
+// previous record untouched, and this check used to pass in exactly those two
+// cases. The probe is rewritten on every boot, so it cannot go stale silently.
+const probePath = value('--probe', join(homedir(), '.dsh', 'subagent-route-pin.probe.json'))
+{
+  let probe
+  try {
+    probe = JSON.parse(readFileSync(probePath, 'utf8'))
+  } catch {
+    probe = undefined
+  }
+  if (probe === undefined) {
+    // Not fatal: an install that predates the probe cannot have one.
+    report('WARN', 'activation probe', `no ${probePath}; the plugin was not imported in this boot, or the record predates it`)
+  } else if (probe.phase === 'parked') {
+    report(
+      'MISS',
+      'activation probe: parked',
+      `${probe.reason} (inject: ${Array.isArray(probe.inject) ? probe.inject.join(', ') : 'unknown'})`
+    )
+    missing += 1
+  } else if (probe.phase === 'failed') {
+    report('MISS', 'activation probe: apply() threw', probe.reason)
+    missing += 1
+  } else if (probe.phase === 'degraded') {
+    report('MISS', 'activation probe: refused to mount', probe.reason)
+    missing += 1
+  } else if (probe.phase === 'applied' && probe.mounted === true) {
+    report('ok', `activation probe: applied (${probe.version})`)
+  } else if (probe.phase === 'applied' && probe.invoked === undefined) {
+    // A record written before this schema existed. It cannot answer "did the
+    // early return keep its verdict", so it is not proof either way.
+    report('WARN', 'activation probe', 'the record predates the mounted/invoked fields; restart DSH')
+  } else {
+    // An `applied` verdict without `mounted: true` is the shape a future early
+    // return would produce if its verdict were dropped. Do not trust it.
+    report('MISS', 'activation probe: no mount verdict', JSON.stringify({ phase: probe.phase, mounted: probe.mounted }))
+    missing += 1
+  }
+}
 
 let record
 try {
